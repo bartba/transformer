@@ -1,5 +1,5 @@
 ---------------------------------------------------------------------------
-KeyError                                  Traceback (most recent call last)
+TypeError                                 Traceback (most recent call last)
 Cell In[9], line 8
       5 epochs_no_improve = 0
       7 for epoch in range(1, num_epochs + 1):
@@ -79,30 +79,15 @@ Cell In[4], line 7, in collate_fn(batch, processor)
       5 labels = [item['labels'] for item in batch]
       6 sizes = torch.stack([item['size'] for item in batch])
 ----> 7 padded_batch = processor.pad(
-      8     {'pixel_values': pixel_values, 'pixel_mask': pixel_mask},
-      9     return_tensors="pt"
-     10 )
-     11 return {
-     12     'pixel_values': padded_batch['pixel_values'],
-     13     'pixel_mask': padded_batch['pixel_mask'],
-     14     'labels': labels,
-     15     'size': sizes
-     16 }
+      8     pixel_values, 
+      9     pixel_mask = True,
+     10     return_tensors="pt"
+     11 )
+     12 return {
+     13     'pixel_values': padded_batch['pixel_values'],
+     14     'pixel_mask': padded_batch['pixel_mask'],
+     15     'labels': labels,
+     16     'size': sizes
+     17 }
 
-File /transformers/src/transformers/models/detr/image_processing_detr.py:1202, in DetrImageProcessor.pad(self, images, annotations, constant_values, return_pixel_mask, return_tensors, data_format, input_data_format, update_bboxes, pad_size)
-   1200     padded_size = (pad_size["height"], pad_size["width"])
-   1201 else:
--> 1202     padded_size = get_max_height_width(images, input_data_format=input_data_format)
-   1204 annotation_list = annotations if annotations is not None else [None] * len(images)
-   1205 padded_images = []
-
-File /transformers/src/transformers/models/detr/image_processing_detr.py:258, in get_max_height_width(images, input_data_format)
-    254 """
-    255 Get the maximum height and width across all images in a batch.
-    256 """
-    257 if input_data_format is None:
---> 258     input_data_format = infer_channel_dimension_format(images[0])
-    260 if input_data_format == ChannelDimension.FIRST:
-    261     _, max_height, max_width = max_across_indices([img.shape for img in images])
-
-KeyError: 0
+TypeError: DetrImageProcessor.pad() got an unexpected keyword argument 'pixel_mask'
