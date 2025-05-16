@@ -1,31 +1,108 @@
-def collate_fn(batch, processor):
-    pixel_values = [item['pixel_values'] for item in batch]
-    pixel_mask = [item['pixel_mask'] for item in batch]
-    labels = [item['labels'] for item in batch]
-    sizes = torch.stack([item['size'] for item in batch])
-    padded_batch = processor.pad(
-        {'pixel_values': pixel_values, 'pixel_mask': pixel_mask},
-        return_tensors="pt"
-    )
-    return {
-        'pixel_values': padded_batch['pixel_values'],
-        'pixel_mask': padded_batch['pixel_mask'],
-        'labels': labels,
-        'size': sizes
-    }
+---------------------------------------------------------------------------
+KeyError                                  Traceback (most recent call last)
+Cell In[9], line 8
+      5 epochs_no_improve = 0
+      7 for epoch in range(1, num_epochs + 1):
+----> 8     train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch, accelerator)
+      9     val_loss, detections = evaluate(model, val_loader, device, processor)
+     11     # Store losses for visualization
 
+Cell In[7], line 5, in train_one_epoch(model, loader, optimizer, device, epoch, accelerator)
+      3 model.train()
+      4 running_loss = 0.0
+----> 5 for batch in tqdm(loader, desc=f"Epoch {epoch}"):
+      6     pixel_values = batch['pixel_values'].to(device)
+      7     labels = [{k: v.to(device) for k, v in t.items()} for t in batch['labels']]
 
-__getitem__에서 squeeze 제거
+File /usr/local/lib/python3.10/dist-packages/tqdm/std.py:1181, in tqdm.__iter__(self)
+   1178 time = self._time
+   1180 try:
+-> 1181     for obj in iterable:
+   1182         yield obj
+   1183         # Update and possibly print the progressbar.
+   1184         # Note: does not call self.update(1) for speed optimisation.
 
-encoding = self.processor(images=image, annotations=coco_anns, return_tensors="pt")
-encoding['size'] = torch.tensor([img_info['height'], img_info['width']])
-return encoding
+File /usr/local/lib/python3.10/dist-packages/accelerate/data_loader.py:566, in DataLoaderShard.__iter__(self)
+    564 # We iterate one batch ahead to check when we are at the end
+    565 try:
+--> 566     current_batch = next(dataloader_iter)
+    567 except StopIteration:
+    568     yield
 
+File /usr/local/lib/python3.10/dist-packages/torch/utils/data/dataloader.py:708, in _BaseDataLoaderIter.__next__(self)
+    705 if self._sampler_iter is None:
+    706     # TODO(https://github.com/pytorch/pytorch/issues/76750)
+    707     self._reset()  # type: ignore[call-arg]
+--> 708 data = self._next_data()
+    709 self._num_yielded += 1
+    710 if (
+    711     self._dataset_kind == _DatasetKind.Iterable
+    712     and self._IterableDataset_len_called is not None
+    713     and self._num_yielded > self._IterableDataset_len_called
+    714 ):
 
+File /usr/local/lib/python3.10/dist-packages/torch/utils/data/dataloader.py:764, in _SingleProcessDataLoaderIter._next_data(self)
+    762 def _next_data(self):
+    763     index = self._next_index()  # may raise StopIteration
+--> 764     data = self._dataset_fetcher.fetch(index)  # may raise StopIteration
+    765     if self._pin_memory:
+    766         data = _utils.pin_memory.pin_memory(data, self._pin_memory_device)
 
-DataLoader에 collate_fn 전달
+File /usr/local/lib/python3.10/dist-packages/torch/utils/data/_utils/fetch.py:55, in _MapDatasetFetcher.fetch(self, possibly_batched_index)
+     53 else:
+     54     data = self.dataset[possibly_batched_index]
+---> 55 return self.collate_fn(data)
 
-train_loader = DataLoader(
-    train_dataset, batch_size=batch_size, shuffle=True, 
-    collate_fn=lambda batch: collate_fn(batch, processor)
-)
+Cell In[6], line 27, in <lambda>(batch)
+     12 train_dataset = COCODetectionDataset(
+     13     annotation_file=train_annotation_file,
+     14     image_dir=image_dir,
+     15     processor=processor,
+     16     transforms=train_transforms
+     17 )
+     18 val_dataset = COCODetectionDataset(
+     19     annotation_file=val_annotation_file,
+     20     image_dir=image_dir.replace("train2017", "val2017"),
+     21     processor=processor,
+     22     transforms=None  # No augmentation for validation
+     23 )
+     25 train_loader = DataLoader(
+     26     train_dataset, batch_size=batch_size, shuffle=True, 
+---> 27     collate_fn=lambda batch: collate_fn(batch, processor)
+     28 )
+     29 val_loader = DataLoader(
+     30     val_dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_fn
+     31 )
+     33 # Prepare with Accelerator
+
+Cell In[4], line 7, in collate_fn(batch, processor)
+      5 labels = [item['labels'] for item in batch]
+      6 sizes = torch.stack([item['size'] for item in batch])
+----> 7 padded_batch = processor.pad(
+      8     {'pixel_values': pixel_values, 'pixel_mask': pixel_mask},
+      9     return_tensors="pt"
+     10 )
+     11 return {
+     12     'pixel_values': padded_batch['pixel_values'],
+     13     'pixel_mask': padded_batch['pixel_mask'],
+     14     'labels': labels,
+     15     'size': sizes
+     16 }
+
+File /transformers/src/transformers/models/detr/image_processing_detr.py:1202, in DetrImageProcessor.pad(self, images, annotations, constant_values, return_pixel_mask, return_tensors, data_format, input_data_format, update_bboxes, pad_size)
+   1200     padded_size = (pad_size["height"], pad_size["width"])
+   1201 else:
+-> 1202     padded_size = get_max_height_width(images, input_data_format=input_data_format)
+   1204 annotation_list = annotations if annotations is not None else [None] * len(images)
+   1205 padded_images = []
+
+File /transformers/src/transformers/models/detr/image_processing_detr.py:258, in get_max_height_width(images, input_data_format)
+    254 """
+    255 Get the maximum height and width across all images in a batch.
+    256 """
+    257 if input_data_format is None:
+--> 258     input_data_format = infer_channel_dimension_format(images[0])
+    260 if input_data_format == ChannelDimension.FIRST:
+    261     _, max_height, max_width = max_across_indices([img.shape for img in images])
+
+KeyError: 0
