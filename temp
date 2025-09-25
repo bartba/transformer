@@ -72,6 +72,45 @@ python /workspace/scripts/train_rtdetrv2.py \
 
 
 
+# JUPYTER CELL 2 — Global config (easy to tweak in notebook)
+CFG = {
+    "model_id": "PaddlePaddle/rt-detrv2-r50",   # <-- Swap to Deformable DETR below if desired
+    "data_root": "/data",                       # mount path
+    "image_size": 640,                          # shortest edge resize
+    "epochs": 50,
+    "train_batch": 4,
+    "eval_batch": 4,
+    "lr": 5e-5,
+    "num_workers": 8,
+    "seed": 42,
+    "output_dir": "/workspace/outputs/rtdetrv2_notebook",
+    "eval_interval": "epoch",                  # "epoch" or "steps"
+    "logging_steps": 50,
+    "save_total_limit": 2,
+    "fp16": True,
+    "warmup_ratio": 0.05,
+    "gradient_accumulation_steps": 1,
+    "weight_decay": 0.05,
+    "max_grad_norm": 1.0,
+    "resume_from_checkpoint": None,            # or path to checkpoint
+    "conf_threshold": 0.001,                   # low threshold for COCO eval, NMS happens inside postprocess
+    "iou_threshold": 0.5,                      # for visualization (not COCO mAP which sweeps 0.5:0.95)
+}
+set_seed(CFG["seed"])
+Path(CFG["output_dir"]).mkdir(parents=True, exist_ok=True)
+
+# Derived paths
+TRAIN_IMG_DIR = f"{CFG['data_root']}/images/train"
+VAL_IMG_DIR   = f"{CFG['data_root']}/images/val"
+TRAIN_JSON    = f"{CFG['data_root']}/annotations/instances_train.json"
+VAL_JSON      = f"{CFG['data_root']}/annotations/instances_val.json"
+
+assert Path(TRAIN_JSON).exists() and Path(VAL_JSON).exists(), "COCO JSON not found."
+
+
+
+
+
 
 
 
