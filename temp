@@ -1,234 +1,180 @@
-import os
-import json
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from torch.optim import AdamW
-from accelerate import Accelerator
-from transformers import DetrForObjectDetection, DetrImageProcessor
-from PIL import Image
-import torchvision.transforms as T
-from tqdm import tqdm
-import matplotlib.pyplot as plt
-from IPython.display import clear_output
-import numpy as np
+# =========================================
+# Dockerfile (train-rtdetrv2)
+# =========================================
+FROM huggingface/transformers-pytorch-gpu
 
-# 1. Custom COCO Dataset Class
-class COCODetectionDataset(Dataset):
-    def __init__(self, annotation_file, image_dir, processor, transforms=None):
-        # Validate input paths
-        if not os.path.exists(annotation_file):
-            raise FileNotFoundError(f"Annotation file not found: {annotation_file}")
-        if not os.path.exists(image_dir):
-            raise FileNotFoundError(f"Image directory not found: {image_dir}")
-        
-        with open(annotation_file, 'r') as f:
-            self.coco = json.load(f)
-        self.image_dir = image_dir
-        self.processor = processor
-        self.transforms = transforms
-        self.image_ids = [img['id'] for img in self.coco['images']]
-        self.annotations = {}
-        for ann in self.coco['annotations']:
-            img_id = ann['image_id']
-            if img_id not in self.annotations:
-                self.annotations[img_id] = []
-            self.annotations[img_id].append(ann)
+# System deps
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git sudo nano vim wget curl unzip ffmpeg libgl1 python-is-python3 \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
 
-    def __len__(self):
-        return len(self.image_ids)
+# Python packages for training & notebooks
+# - transformers/accelerate: HF training stack
+# - datasets: load COCO or custom sets
+# - evaluate: metrics glue
+# - pycocotools: COCO metrics
+# - albumentations: common augs (optional)
+# - jupyter/tensorboard: same as your YOLO workflow
+# - fastapi/uvicorn: keep parity; handy for quick eval servers
+RUN pip install --no-cache-dir \
+    "transformers>=4.43.0" \
+    "accelerate>=0.33.0" \
+    "datasets>=2.20.0" \
+    "evaluate>=0.4.2" \
+    "pycocotools>=2.0.7" \
+    "albumentations>=1.4.8" \
+    "opencv-python" \
+    "numpy" "pandas" "matplotlib" \
+    "tensorboard" \
+    "jupyter" "notebook" \
+    "fastapi" "uvicorn[standard]"
 
-    def __getitem__(self, idx):
-        img_id = self.image_ids[idx]
-        img_info = next(img for img in self.coco['images'] if img['id'] == img_id)
-        img_path = os.path.join(self.image_dir, img_info['file_name'])
-        
-        # Verify image exists
-        if not os.path.exists(img_path):
-            raise FileNotFoundError(f"Image not found: {img_path}")
-        
-        image = Image.open(img_path).convert('RGB')
+# (Optional) bitsandbytes for 8-bit optimizers on large models
+# RUN pip install --no-cache-dir bitsandbytes
 
-        if self.transforms:
-            image = self.transforms(image)
+# Workdir & ports
+WORKDIR /workspace
+EXPOSE 8888 6006
 
-        coco_anns = {
-            'image_id': img_id,
-            'annotations': self.annotations.get(img_id, [])
-        }
-        encoding = self.processor(images=image, annotations=coco_anns, return_tensors="pt")
-        
-        # Keep batch dimension and add size
-        encoding['size'] = torch.tensor([img_info['height'], img_info['width']])
-        
-        # Debug: Print encoding structure (remove after debugging)
-        # print(f"Encoding keys: {list(encoding.keys())}")
-        # print(f"Pixel_values shape: {encoding['pixel_values'].shape}")
-        # print(f"Labels: {encoding['labels']}")
-        
-        return encoding
+# Place training scripts (see below)
+# You can COPY your project files here; leaving commented so you can bind-mount instead.
+# COPY ./train /workspace/train
 
-# 2. Collate Function for Padding
-def collate_fn(batch, processor):
-    # Extract pixel_values, labels, and sizes from batch
-    pixel_values = [item['pixel_values'] for item in batch]
-    labels = [item['labels'] for item in batch]
-    sizes = torch.stack([item['size'] for item in batch])
-    
-    # Pad pixel_values and generate pixel_mask
-    padded_batch = processor.pad(
-        pixel_values,
-        return_pixel_mask=True,
-        return_tensors="pt"
+# Jupyter (no token) like your YOLOv12 image
+CMD ["bash", "-lc", "jupyter notebook --ip=0.0.0.0 --allow-root --no-browser --NotebookApp.token='' --NotebookApp.password='' --NotebookApp.quit_button=False"]
+
+
+
+
+
+
+
+# 1) Build
+docker build -t train-rtdetrv2 -f Dockerfile .
+
+# 2) Run (mount your dataset & logs)
+docker run --gpus all -it --rm \
+  -p 8888:8888 -p 6006:6006 \
+  -v /path/to/your/dataset:/data \
+  -v $(pwd)/outputs:/workspace/outputs \
+  -v $(pwd)/scripts:/workspace/scripts \
+  --shm-size=1g \
+  --name rtdetr_train \
+  train-rtdetrv2
+
+# 3) In container, launch training
+python /workspace/scripts/train_rtdetrv2.py \
+  --any-args  # (script uses env vars; set MODEL_ID, DATA_DIR, etc. via -e on docker run)
+
+# Example with env overrides:
+# docker run ... -e MODEL_ID="PaddlePaddle/rt-detrv2-r18" -e BATCH=8 -e EPOCHS=100 ...
+
+
+
+
+
+
+
+#===================
+# train_rtdetrv2.py
+#===================
+import os, json, torch
+from datasets import load_dataset
+from transformers import AutoImageProcessor, AutoModelForObjectDetection, Trainer, TrainingArguments, DefaultDataCollator
+
+# === Config ===
+MODEL_ID = os.getenv("MODEL_ID", "PaddlePaddle/rt-detrv2-r50")  # Example; pick a size that fits your GPU
+DATA_DIR = os.getenv("DATA_DIR", "/data")
+OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/workspace/outputs/rtdetrv2")
+IMAGE_SIZE = int(os.getenv("IMAGE_SIZE", "640"))
+NUM_WORKERS = int(os.getenv("NUM_WORKERS", "8"))
+
+# === Load processor/model ===
+processor = AutoImageProcessor.from_pretrained(MODEL_ID)
+model = AutoModelForObjectDetection.from_pretrained(
+    MODEL_ID,
+    ignore_mismatched_sizes=True,  # helpful when class count differs from pretrain
+)
+
+# === Dataset: COCO format via HF datasets ===
+# Expect files under: /data/images/{train,val} and /data/annotations/instances_{train,val}.json
+def coco_loader(split):
+    return load_dataset(
+        "coco",
+        data_dir=DATA_DIR,
+        split=split,
+        # if local COCO, we point to images/ and annotations/ under DATA_DIR
     )
-    
-    # Debug: Print padded batch structure (remove after debugging)
-    # print(f"Padded batch keys: {list(padded_batch.keys())}")
-    # print(f"Padded pixel_values shape: {padded_batch['pixel_values'].shape}")
-    
-    # Return batch with padded pixel_values, pixel_mask, labels, and sizes
-    return {
-        'pixel_values': padded_batch['pixel_values'],
-        'pixel_mask': padded_batch['pixel_mask'],
-        'labels': labels,
-        'size': sizes
-    }
 
-# 3. Initialize Accelerator, Model, and Optimizer
-accelerator = Accelerator()
-device = accelerator.device
-device_lr = 1e-4
-batch_size = 2
-num_epochs = 10
-patience = 3
+train_ds = coco_loader("train")
+val_ds   = coco_loader("validation")
 
-processor = DetrImageProcessor.from_pretrained("facebook/detr-resnet-50")
-model = DetrForObjectDetection.from_pretrained("facebook/detr-resnet-50")
-optimizer = AdamW(model.parameters(), lr=device_lr)
+# === Preprocess ===
+id2label = {i: c for i, c in enumerate(train_ds.features["objects"].feature["category"].names)}
+label2id = {v: k for k, v in id2label.items()}
+model.config.id2label = id2label
+model.config.label2id = label2id
 
-# 4. Load COCO Dataset
-# Update these paths to your actual COCO dataset paths
-image_dir = "/path/to/coco/train2017"  # e.g., "/data/coco/train2017"
-train_annotation_file = "/path/to/coco/annotations/instances_train2017.json"  # e.g., "/data/coco/annotations/instances_train2017.json"
-val_annotation_file = "/path/to/coco/annotations/instances_val2017.json"  # e.g., "/data/coco/annotations/instances_val2017.json"
+def transform(example):
+    images = [x for x in example["image"]]
+    targets = []
+    for anns in example["objects"]:
+        boxes = anns["bbox"]      # [x, y, w, h]
+        area  = anns["area"]
+        cats  = anns["category"]
+        iscrowd = anns["is_crowd"]
+        targets.append({
+            "boxes": boxes,
+            "classes": cats,
+            "area": area,
+            "iscrowd": iscrowd,
+        })
+    proc = processor(
+        images,
+        annotations=targets,
+        return_tensors="pt",
+        size={"shortest_edge": IMAGE_SIZE},  # RT-DETR uses resize w/ keep aspect
+    )
+    return proc
 
-train_transforms = T.Compose([
-    T.RandomHorizontalFlip(p=0.5),
-])
+train_ds = train_ds.with_transform(transform)
+val_ds   = val_ds.with_transform(transform)
 
-train_dataset = COCODetectionDataset(
-    annotation_file=train_annotation_file,
-    image_dir=image_dir,
-    processor=processor,
-    transforms=train_transforms
-)
-val_dataset = COCODetectionDataset(
-    annotation_file=val_annotation_file,
-    image_dir=image_dir.replace("train2017", "val2017"),
-    processor=processor,
-    transforms=None
-)
-
-train_loader = DataLoader(
-    train_dataset, batch_size=batch_size, shuffle=True, 
-    collate_fn=lambda batch: collate_fn(batch, processor)
-)
-val_loader = DataLoader(
-    val_dataset, batch_size=batch_size, shuffle=False, 
-    collate_fn=lambda batch: collate_fn(batch, processor)
+# === Training ===
+args = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+    per_device_train_batch_size=int(os.getenv("BATCH", "2")),
+    per_device_eval_batch_size=int(os.getenv("BATCH_EVAL", "2")),
+    dataloader_num_workers=NUM_WORKERS,
+    learning_rate=float(os.getenv("LR", "5e-5")),
+    num_train_epochs=int(os.getenv("EPOCHS", "50")),
+    fp16=torch.cuda.is_available(),
+    save_strategy="epoch",
+    evaluation_strategy="epoch",
+    logging_steps=50,
+    report_to=["tensorboard"],
 )
 
-train_loader, val_loader, model, optimizer = accelerator.prepare(
-    train_loader, val_loader, model, optimizer
+trainer = Trainer(
+    model=model,
+    args=args,
+    train_dataset=train_ds,
+    eval_dataset=val_ds,
+    data_collator=DefaultDataCollator(),
 )
 
-# 5. Training Function
-def train_one_epoch(model, loader, optimizer, device, epoch, accelerator):
-    model.train()
-    running_loss = 0.0
-    for batch in tqdm(loader, desc=f"Epoch {epoch}"):
-        pixel_values = batch['pixel_values'].to(device)
-        labels = [{k: v.to(device) for k, v in t.items()} for t in batch['labels']]
-        
-        # Debug: Print batch structure (remove after debugging)
-        # print(f"Batch keys: {list(batch.keys())}")
-        # print(f"Pixel_values shape: {batch['pixel_values'].shape}")
-        # print(f"Labels sample: {labels[0]}")
-        
-        outputs = model(pixel_values=pixel_values, labels=labels)
-        loss = outputs.loss
-        
-        optimizer.zero_grad()
-        accelerator.backward(loss)
-        optimizer.step()
-        
-        running_loss += loss.item()
-    
-    avg_loss = running_loss / len(loader)
-    print(f"Epoch: {epoch}, Train Loss: {avg_loss:.4f}")
-    return avg_loss
+trainer.train()
+trainer.save_model(OUTPUT_DIR)
+processor.save_pretrained(OUTPUT_DIR)
 
-# 6. Evaluation Function
-@torch.no_grad()
-def evaluate(model, loader, device, processor, threshold=0.5):
-    model.eval()
-    total_loss = 0.0
-    all_results = []
-    for batch in loader:
-        pixel_values = batch['pixel_values'].to(device)
-        labels = [{k: v.to(device) for k, v in t.items()} for t in batch['labels']]
-        target_sizes = batch['size'].to(device)
-        
-        outputs = model(pixel_values=pixel_values, labels=labels)
-        loss = outputs.loss
-        total_loss += loss.item()
-        
-        results = processor.post_process_object_detection(
-            outputs, target_sizes=target_sizes, threshold=threshold
-        )
-        all_results.extend(results)
-    
-    avg_loss = total_loss / len(loader)
-    print(f"Validation Loss: {avg_loss:.4f}")
-    return avg_loss, all_results
+# Swap to Deformable DETR by changing just two lines:
+# MODEL_ID = "SenseTime/deformable-detr-single-scale-dc5"  # or another HF ckpt
+# from transformers import DeformableDetrImageProcessor as AutoImageProcessor, DeformableDetrForObjectDetection as AutoModelForObjectDetection
 
-# 7. Training Loop with Visualization and Early Stopping
-train_losses = []
-val_losses = []
-best_val_loss = float('inf')
-epochs_no_improve = 0
 
-for epoch in range(1, num_epochs + 1):
-    train_loss = train_one_epoch(model, train_loader, optimizer, device, epoch, accelerator)
-    val_loss, detections = evaluate(model, val_loader, device, processor)
-    
-    train_losses.append(train_loss)
-    val_losses.append(val_loss)
-    
-    clear_output(wait=True)
-    plt.figure(figsize=(10, 5))
-    plt.plot(train_losses, label="Train Loss")
-    plt.plot(val_losses, label="Validation Loss")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.legend()
-    plt.title("Training and Validation Loss")
-    plt.show()
-    
-    if val_loss < best_val_loss:
-        best_val_loss = val_loss
-        epochs_no_improve = 0
-        accelerator.wait_for_everyone()
-        unwrapped_model = accelerator.unwrap_model(model)
-        torch.save(unwrapped_model.state_dict(), "detr_finetuned.pth")
-    else:
-        epochs_no_improve += 1
-        print(f"No improvement for {epochs_no_improve} epoch(s).")
-        if epochs_no_improve >= patience:
-            print(f"Early stopping at epoch {epoch}. Best val loss: {best_val_loss:.4f}")
-            break
 
-# 8. Save Final Model
-accelerator.wait_for_everyone()
-unwrapped_model = accelerator.unwrap_model(model)
-torch.save(unwrapped_model.state_dict(), "detr_finetuned_final.pth")
+
+
+
+
+
