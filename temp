@@ -1,316 +1,269 @@
-# =========================================
-# Dockerfile (train-rtdetrv2)
-# =========================================
-FROM huggingface/transformers-pytorch-gpu
+# This cell builds a ready-to-run Jupyter notebook that:
+# 1) Splits a YOLOv4-style dataset into train/val by a user-set ratio
+# 2) Converts labels to COCO format
+# 3) Copies images into the requested directory structure:
+#    /workspace/images/train, /workspace/images/val
+#    /workspace/annotations/instances_train.json, ..._val.json
 
-# System deps
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    git sudo nano vim wget curl unzip ffmpeg libgl1 python-is-python3 \
-    && apt-get clean && rm -rf /var/lib/apt/lists/*
+import json, os, nbformat as nbf
 
-# Python packages for training & notebooks
-# - transformers/accelerate: HF training stack
-# - datasets: load COCO or custom sets
-# - evaluate: metrics glue
-# - pycocotools: COCO metrics
-# - albumentations: common augs (optional)
-# - jupyter/tensorboard: same as your YOLO workflow
-# - fastapi/uvicorn: keep parity; handy for quick eval servers
-RUN pip install --no-cache-dir \
-    "transformers>=4.43.0" \
-    "accelerate>=0.33.0" \
-    "datasets>=2.20.0" \
-    "evaluate>=0.4.2" \
-    "pycocotools>=2.0.7" \
-    "albumentations>=1.4.8" \
-    "opencv-python" \
-    "numpy" "pandas" "matplotlib" \
-    "tensorboard" \
-    "jupyter" "notebook" \
-    "fastapi" "uvicorn[standard]"
+nb = nbf.v4.new_notebook()
 
-# (Optional) bitsandbytes for 8-bit optimizers on large models
-# RUN pip install --no-cache-dir bitsandbytes
+cells = []
 
-# Workdir & ports
-WORKDIR /workspace
-EXPOSE 8888 6006
+# 1) Title/Intro
+cells.append(nbf.v4.new_markdown_cell("""
+# YOLOv4 ➜ COCO Converter & Splitter
 
-# Place training scripts (see below)
-# You can COPY your project files here; leaving commented so you can bind-mount instead.
-# COPY ./train /workspace/train
+This notebook will:
+- Read YOLOv4-style labels from `/workspace/tmp` (images + `.txt` label files).
+- Split into Train/Val using a ratio you pick.
+- Convert annotations to COCO and copy images into:
+  - `/workspace/images/train` and `/workspace/images/val`
+  - `/workspace/annotations/instances_train.json` and `/workspace/annotations/instances_val.json`
 
-# Jupyter (no token) like your YOLOv12 image
-CMD ["bash", "-lc", "jupyter notebook --ip=0.0.0.0 --allow-root --no-browser --NotebookApp.token='' --NotebookApp.password='' --NotebookApp.quit_button=False"]
+**Notes**
+- If `/workspace/tmp/classes.txt` exists, class names will be taken from it (one name per line, index = class id).
+- If no `classes.txt`, categories will be auto-named like `class_0`, `class_1`, ...
+- Images without a matching label `.txt` will be included with **zero annotations**.
+"""))
 
+# 2) Parameters
+cells.append(nbf.v4.new_code_cell("""
+# ==== User parameters ====
+SRC_DIR = "/workspace/tmp"              # Where original YOLO images/labels live
+OUT_IMG_DIR = "/workspace/images"       # Will create 'train' and 'val' inside this
+OUT_ANN_DIR = "/workspace/annotations"  # Will write COCO JSONs here
 
+# Train/Val split ratio: e.g., 0.8 means 80% train / 20% val
+TRAIN_RATIO = 0.8
 
+# Random seed for reproducible splitting
+RANDOM_SEED = 42
 
+# Image extensions to consider
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+"""))
 
+# 3) Imports & helpers
+cells.append(nbf.v4.new_code_cell("""
+import os, shutil, random, json, math
+from pathlib import Path
+from PIL import Image
+from typing import List, Dict, Tuple
 
+random.seed(RANDOM_SEED)
 
-# 1) Build
-docker build -t train-rtdetrv2 -f Dockerfile .
+def load_class_names(src_dir: str) -> List[str]:
+    classes_path = Path(src_dir) / "classes.txt"
+    if classes_path.exists():
+        with open(classes_path, "r", encoding="utf-8") as f:
+            names = [ln.strip() for ln in f if ln.strip()]
+        return names
+    return []  # will auto-generate later
 
-# 2) Run (mount your dataset & logs)
-docker run --gpus all -it --rm \
-  -p 8888:8888 -p 6006:6006 \
-  -v /path/to/your/dataset:/data \
-  -v $(pwd)/outputs:/workspace/outputs \
-  -v $(pwd)/scripts:/workspace/scripts \
-  --shm-size=1g \
-  --name rtdetr_train \
-  train-rtdetrv2
+def list_images(src_dir: str) -> List[Path]:
+    p = Path(src_dir)
+    imgs = [fp for fp in p.iterdir() if fp.is_file() and fp.suffix.lower() in IMG_EXTS]
+    return sorted(imgs)
 
-# 3) In container, launch training
-python /workspace/scripts/train_rtdetrv2.py \
-  --any-args  # (script uses env vars; set MODEL_ID, DATA_DIR, etc. via -e on docker run)
+def paired_label_path(img_path: Path) -> Path:
+    return img_path.with_suffix(".txt")
 
-# Example with env overrides:
-# docker run ... -e MODEL_ID="PaddlePaddle/rt-detrv2-r18" -e BATCH=8 -e EPOCHS=100 ...
+def read_image_size(img_path: Path) -> Tuple[int, int]:
+    with Image.open(img_path) as im:
+        w, h = im.size
+    return w, h
 
+def ensure_dirs():
+    Path(OUT_IMG_DIR, "train").mkdir(parents=True, exist_ok=True)
+    Path(OUT_IMG_DIR, "val").mkdir(parents=True, exist_ok=True)
+    Path(OUT_ANN_DIR).mkdir(parents=True, exist_ok=True)
 
+def yolo_line_to_bbox_xywh_pix(line: str, W: int, H: int) -> Tuple[int, float, float, float, float]:
+    # YOLO format: class x_center y_center width height  (normalized 0..1)
+    parts = line.strip().split()
+    if len(parts) < 5:
+        raise ValueError(f"Bad label line: '{line}'")
+    cid = int(parts[0])
+    xc, yc, ww, hh = map(float, parts[1:5])
+    x = (xc - ww/2.0) * W
+    y = (yc - hh/2.0) * H
+    w = ww * W
+    h = hh * H
 
+    # clip to image bounds
+    x = max(0.0, min(x, W - 1.0))
+    y = max(0.0, min(y, H - 1.0))
+    w = max(0.0, min(w, W - x))
+    h = max(0.0, min(h, H - y))
+    return cid, x, y, w, h
 
-# JUPYTER CELL 2 — Global config (easy to tweak in notebook)
-CFG = {
-    "model_id": "PaddlePaddle/rt-detrv2-r50",   # <-- Swap to Deformable DETR below if desired
-    "data_root": "/data",                       # mount path
-    "image_size": 640,                          # shortest edge resize
-    "epochs": 50,
-    "train_batch": 4,
-    "eval_batch": 4,
-    "lr": 5e-5,
-    "num_workers": 8,
-    "seed": 42,
-    "output_dir": "/workspace/outputs/rtdetrv2_notebook",
-    "eval_interval": "epoch",                  # "epoch" or "steps"
-    "logging_steps": 50,
-    "save_total_limit": 2,
-    "fp16": True,
-    "warmup_ratio": 0.05,
-    "gradient_accumulation_steps": 1,
-    "weight_decay": 0.05,
-    "max_grad_norm": 1.0,
-    "resume_from_checkpoint": None,            # or path to checkpoint
-    "conf_threshold": 0.001,                   # low threshold for COCO eval, NMS happens inside postprocess
-    "iou_threshold": 0.5,                      # for visualization (not COCO mAP which sweeps 0.5:0.95)
-}
-set_seed(CFG["seed"])
-Path(CFG["output_dir"]).mkdir(parents=True, exist_ok=True)
+def make_categories(class_names: List[str], max_class_id: int) -> List[Dict]:
+    cats = []
+    if class_names:
+        for i, name in enumerate(class_names):
+            cats.append({"id": i, "name": name, "supercategory": "object"})
+    else:
+        for i in range(max_class_id + 1):
+            cats.append({"id": i, "name": f"class_{i}", "supercategory": "object"})
+    return cats
+"""))
 
-# Derived paths
-TRAIN_IMG_DIR = f"{CFG['data_root']}/images/train"
-VAL_IMG_DIR   = f"{CFG['data_root']}/images/val"
-TRAIN_JSON    = f"{CFG['data_root']}/annotations/instances_train.json"
-VAL_JSON      = f"{CFG['data_root']}/annotations/instances_val.json"
+# 4) Scan dataset and split
+cells.append(nbf.v4.new_code_cell("""
+# Scan
+all_images = list_images(SRC_DIR)
+print(f"Found {len(all_images)} images in {SRC_DIR}")
 
-assert Path(TRAIN_JSON).exists() and Path(VAL_JSON).exists(), "COCO JSON not found."
+# Derive set of class names (if present)
+class_names = load_class_names(SRC_DIR)
 
+# Build pairs (image, label or None)
+pairs = []
+max_cls_id_seen = -1
 
+for img in all_images:
+    lbl = paired_label_path(img)
+    pairs.append((img, lbl if lbl.exists() else None))
 
+    # Peek into label to track max class id
+    if lbl.exists():
+        with open(lbl, "r", encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if not ln:
+                    continue
+                cid = int(ln.split()[0])
+                if cid > max_cls_id_seen:
+                    max_cls_id_seen = cid
 
+print(f"Images with labels: {sum(1 for _, l in pairs if l is not None)}")
+print(f"Images without labels: {sum(1 for _, l in pairs if l is None)}")
+print(f"Max class id seen: {max_cls_id_seen if max_cls_id_seen >= 0 else 'none (no labels found?)'}")
 
+# Split
+N = len(pairs)
+train_count = int(round(N * TRAIN_RATIO))
+indices = list(range(N))
+random.shuffle(indices)
+train_idx = set(indices[:train_count])
+val_idx   = set(indices[train_count:])
 
+train_pairs = [pairs[i] for i in range(N) if i in train_idx]
+val_pairs   = [pairs[i] for i in range(N) if i in val_idx]
 
+print(f"Train images: {len(train_pairs)} | Val images: {len(val_pairs)}")
+"""))
 
-# JUPYTER CELL 4 — Dataset
-class CocoDetectionDataset(Dataset):
-    """
-    Returns raw PIL image and COCO-style target dict.
-    We transform to model inputs in a collate_fn (keeps flexibility).
-    """
-    def __init__(self, img_dir: str, ann_file: str, transforms: A.BasicTransform | None = None):
-        self.coco = COCO(ann_file)
-        self.img_dir = Path(img_dir)
-        self.ids = list(self.coco.imgs.keys())
-        self.transforms = transforms
+# 5) Conversion function
+cells.append(nbf.v4.new_code_cell("""
+def convert_and_copy(pairs, subset: str, categories: List[Dict]):
+    assert subset in {"train","val"}
+    images = []
+    annotations = []
+    ann_id = 1
+    img_id = 1
 
-        # build category mappings
-        cats = self.coco.loadCats(self.coco.getCatIds())
-        self.catid2contig = {cat["id"]: i for i, cat in enumerate(sorted(cats, key=lambda x: x["id"]))}
-        self.id2label = {i: cat["name"] for i, cat in enumerate(sorted(cats, key=lambda x: x["id"]))}
-        self.label2id = {v: k for k, v in self.id2label.items()}
+    out_img_dir = Path(OUT_IMG_DIR, subset)
+    for img_path, lbl_path in pairs:
+        W, H = read_image_size(img_path)
+        # Copy image
+        dest = out_img_dir / img_path.name
+        if str(img_path.resolve()) != str(dest.resolve()):
+            shutil.copy2(img_path, dest)
 
-    def __len__(self): return len(self.ids)
-
-    def _load_image(self, img_info):
-        path = self.img_dir / img_info["file_name"]
-        img = Image.open(path).convert("RGB")
-        return img
-
-    def __getitem__(self, idx):
-        img_id = self.ids[idx]
-        img_info = self.coco.loadImgs([img_id])[0]
-        ann_ids = self.coco.getAnnIds(imgIds=[img_id], iscrowd=None)
-        anns = self.coco.loadAnns(ann_ids)
-
-        # build target
-        boxes, classes, area, iscrowd = [], [], [], []
-        for a in anns:
-            # Skip degenerate boxes
-            x, y, w, h = a["bbox"]
-            if w <= 1 or h <= 1:
-                continue
-            boxes.append([x, y, w, h])  # COCO xywh
-            classes.append(self.catid2contig[a["category_id"]])
-            area.append(a.get("area", w * h))
-            iscrowd.append(int(a.get("iscrowd", 0)))
-
-        img = self._load_image(img_info)
-
-        # Albumentations (optional, applied on np array)
-        if self.transforms is not None:
-            img_np = np.array(img)
-            # Convert boxes to albumentations format
-            b = np.array(boxes, dtype=np.float32) if boxes else np.zeros((0, 4), np.float32)
-            labels = classes
-            transformed = self.transforms(
-                image=img_np,
-                bboxes=b.tolist(),
-                class_labels=labels
-            )
-            img = Image.fromarray(transformed["image"])
-            boxes = transformed["bboxes"]
-            classes = transformed["class_labels"]
-
-        target = {
-            "image_id": img_id,
-            "boxes": boxes,            # xywh
-            "classes": classes,        # contiguous ids
-            "area": area,
-            "iscrowd": iscrowd,
-            "orig_size": [img_info["height"], img_info["width"]],
-            "size": [img.size[1], img.size[0]],
-        }
-        return img, target
-
-# Light/default augmentations (feel free to extend)
-train_tfms = A.Compose([
-    A.LongestMaxSize(max_size=CFG["image_size"]),
-    A.PadIfNeeded(CFG["image_size"], CFG["image_size"], border_mode=cv2.BORDER_CONSTANT),
-    A.HorizontalFlip(p=0.5),
-], bbox_params=A.BboxParams(format="coco", label_fields=["class_labels"]))
-
-val_tfms = A.Compose([
-    A.LongestMaxSize(max_size=CFG["image_size"]),
-    A.PadIfNeeded(CFG["image_size"], CFG["image_size"], border_mode=cv2.BORDER_CONSTANT),
-], bbox_params=A.BboxParams(format="coco", label_fields=["class_labels"]))
-
-train_ds = CocoDetectionDataset(TRAIN_IMG_DIR, TRAIN_JSON, transforms=train_tfms)
-val_ds   = CocoDetectionDataset(VAL_IMG_DIR,   VAL_JSON,   transforms=val_tfms)
-
-# Propagate labels into model config (nice to have)
-model.config.id2label = train_ds.id2label
-model.config.label2id = {v: k for k, v in train_ds.id2label.items()}
-len(train_ds), len(val_ds), train_ds.id2label
-
-
-
-
-
-
-
-
-
-
-
-#===================
-# train_rtdetrv2.py
-#===================
-import os, json, torch
-from datasets import load_dataset
-from transformers import AutoImageProcessor, AutoModelForObjectDetection, Trainer, TrainingArguments, DefaultDataCollator
-
-# === Config ===
-MODEL_ID = os.getenv("MODEL_ID", "PaddlePaddle/rt-detrv2-r50")  # Example; pick a size that fits your GPU
-DATA_DIR = os.getenv("DATA_DIR", "/data")
-OUTPUT_DIR = os.getenv("OUTPUT_DIR", "/workspace/outputs/rtdetrv2")
-IMAGE_SIZE = int(os.getenv("IMAGE_SIZE", "640"))
-NUM_WORKERS = int(os.getenv("NUM_WORKERS", "8"))
-
-# === Load processor/model ===
-processor = AutoImageProcessor.from_pretrained(MODEL_ID)
-model = AutoModelForObjectDetection.from_pretrained(
-    MODEL_ID,
-    ignore_mismatched_sizes=True,  # helpful when class count differs from pretrain
-)
-
-# === Dataset: COCO format via HF datasets ===
-# Expect files under: /data/images/{train,val} and /data/annotations/instances_{train,val}.json
-def coco_loader(split):
-    return load_dataset(
-        "coco",
-        data_dir=DATA_DIR,
-        split=split,
-        # if local COCO, we point to images/ and annotations/ under DATA_DIR
-    )
-
-train_ds = coco_loader("train")
-val_ds   = coco_loader("validation")
-
-# === Preprocess ===
-id2label = {i: c for i, c in enumerate(train_ds.features["objects"].feature["category"].names)}
-label2id = {v: k for k, v in id2label.items()}
-model.config.id2label = id2label
-model.config.label2id = label2id
-
-def transform(example):
-    images = [x for x in example["image"]]
-    targets = []
-    for anns in example["objects"]:
-        boxes = anns["bbox"]      # [x, y, w, h]
-        area  = anns["area"]
-        cats  = anns["category"]
-        iscrowd = anns["is_crowd"]
-        targets.append({
-            "boxes": boxes,
-            "classes": cats,
-            "area": area,
-            "iscrowd": iscrowd,
+        # Register image in COCO
+        images.append({
+            "id": img_id,
+            "file_name": dest.name,
+            "width": W,
+            "height": H
         })
-    proc = processor(
-        images,
-        annotations=targets,
-        return_tensors="pt",
-        size={"shortest_edge": IMAGE_SIZE},  # RT-DETR uses resize w/ keep aspect
-    )
-    return proc
 
-train_ds = train_ds.with_transform(transform)
-val_ds   = val_ds.with_transform(transform)
+        # Parse labels (if any)
+        if lbl_path and lbl_path.exists():
+            with open(lbl_path, "r", encoding="utf-8") as f:
+                for ln in f:
+                    ln = ln.strip()
+                    if not ln:
+                        continue
+                    cid, x, y, w, h = yolo_line_to_bbox_xywh_pix(ln, W, H)
+                    area = float(w * h)
+                    annotations.append({
+                        "id": ann_id,
+                        "image_id": img_id,
+                        "category_id": cid,
+                        "bbox": [float(x), float(y), float(w), float(h)],
+                        "area": area,
+                        "iscrowd": 0,
+                        "segmentation": []
+                    })
+                    ann_id += 1
 
-# === Training ===
-args = TrainingArguments(
-    output_dir=OUTPUT_DIR,
-    per_device_train_batch_size=int(os.getenv("BATCH", "2")),
-    per_device_eval_batch_size=int(os.getenv("BATCH_EVAL", "2")),
-    dataloader_num_workers=NUM_WORKERS,
-    learning_rate=float(os.getenv("LR", "5e-5")),
-    num_train_epochs=int(os.getenv("EPOCHS", "50")),
-    fp16=torch.cuda.is_available(),
-    save_strategy="epoch",
-    evaluation_strategy="epoch",
-    logging_steps=50,
-    report_to=["tensorboard"],
-)
+        img_id += 1
 
-trainer = Trainer(
-    model=model,
-    args=args,
-    train_dataset=train_ds,
-    eval_dataset=val_ds,
-    data_collator=DefaultDataCollator(),
-)
+    coco = {
+        "info": {
+            "description": "Converted from YOLOv4",
+            "url": "",
+            "version": "1.0",
+            "year": 2025,
+            "contributor": "",
+            "date_created": ""
+        },
+        "licenses": [],
+        "images": images,
+        "annotations": annotations,
+        "categories": categories
+    }
+    return coco
+"""))
 
-trainer.train()
-trainer.save_model(OUTPUT_DIR)
-processor.save_pretrained(OUTPUT_DIR)
+# 6) Run conversion and save JSONs
+cells.append(nbf.v4.new_code_cell("""
+ensure_dirs()
 
-# Swap to Deformable DETR by changing just two lines:
-# MODEL_ID = "SenseTime/deformable-detr-single-scale-dc5"  # or another HF ckpt
-# from transformers import DeformableDetrImageProcessor as AutoImageProcessor, DeformableDetrForObjectDetection as AutoModelForObjectDetection
+# Categories (prefer names from classes.txt; else auto-generate)
+if class_names:
+    categories = [{"id": i, "name": n, "supercategory": "object"} for i, n in enumerate(class_names)]
+else:
+    categories = make_categories([], max_cls_id_seen if max_cls_id_seen >= 0 else 0)
 
+coco_train = convert_and_copy(train_pairs, "train", categories)
+coco_val   = convert_and_copy(val_pairs, "val", categories)
+
+ann_train_path = Path(OUT_ANN_DIR, "instances_train.json")
+ann_val_path   = Path(OUT_ANN_DIR, "instances_val.json")
+
+with open(ann_train_path, "w", encoding="utf-8") as f:
+    json.dump(coco_train, f, ensure_ascii=False)
+with open(ann_val_path, "w", encoding="utf-8") as f:
+    json.dump(coco_val, f, ensure_ascii=False)
+
+print("==== Done ====")
+print(f"Wrote: {ann_train_path}")
+print(f"Wrote: {ann_val_path}")
+print(f"Images copied to: {Path(OUT_IMG_DIR, 'train')} and {Path(OUT_IMG_DIR, 'val')}")
+print(f"Categories: {[c['name'] for c in categories]}")
+print(f"Train: {len(coco_train['images'])} images, {len(coco_train['annotations'])} annotations")
+print(f"Val:   {len(coco_val['images'])} images, {len(coco_val['annotations'])} annotations")
+"""))
+
+# 7) Optional: quick peek of a few records
+cells.append(nbf.v4.new_code_cell("""
+# Peek first image & annotation entries (if any)
+print("Sample train image record:", coco_train["images"][0] if coco_train["images"] else "None")
+print("Sample train annotation record:", coco_train["annotations"][0] if coco_train["annotations"] else "None")
+"""))
+
+nb.cells = cells
+
+out_nb_path = "/mnt/data/yolov4_to_coco_split.ipynb"
+with open(out_nb_path, "w", encoding="utf-8") as f:
+    nbf.write(nb, f)
+
+out_nb_path
 
 
 
