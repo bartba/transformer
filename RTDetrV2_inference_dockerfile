@@ -1,0 +1,51 @@
+# CUDA + PyTorch 런타임 이미지 (필요 시 버전 조정)
+FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# 시스템 패키지
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3-opencv \
+    ca-certificates \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# 파이썬 패키지
+# (opencv-python-headless를 선호하면 python3-opencv 대신 여기에 설치하세요)
+RUN pip install --no-cache-dir \
+    transformers==4.43.3 \
+    accelerate \
+    huggingface-hub \
+    pyzmq \
+    pyyaml \
+    requests \
+    numpy \
+    Pillow \
+    uvloop
+
+# 앱 복사
+WORKDIR /app
+COPY app.py /app/app.py
+
+# 모델은 컨테이너 외부에서 마운트하는 것을 권장
+# 예: -v /host/path/to/rtdetrv2_model:/app/models
+
+# 포트
+ENV PORT=30034
+EXPOSE 30034
+
+# 성능/환경 변수(원 YOLO앱 호환)
+ENV MAX_DET=100 \
+    IMGSZ=416 \
+    CONF=0.25 \
+    IOU=0.45 \
+    DEVICE=0 \
+    BASE_DIR=/app
+
+# (프록시/CA 인증서가 필요 없는 환경이면 아래 ENV는 무시되거나 제거해도 됩니다)
+ENV REQUESTS_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt \
+    CURL_CA_BUNDLE=/etc/ssl/certs/ca-certificates.crt
+
+# 실행
+CMD ["python", "-u", "/app/app.py"]
