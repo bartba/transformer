@@ -1,0 +1,394 @@
+# Re-create the cleaned app.py file (ensuring the session is active).
+content = r'''
+import os
+import sys
+import cv2
+import zmq
+import json
+import base64
+import time
+import yaml
+import torch
+import requests
+import numpy as np
+import logging
+from logging import handlers
+from pathlib import Path
+from datetime import datetime
+from typing import List, Dict, Any, Optional, Tuple
+
+from huggingface_hub import configure_http_backend
+from transformers import (
+    AutoImageProcessor,
+    AutoModelForObjectDetection,
+)
+
+# =========================
+# Env & Defaults
+# =========================
+MAX_DET = int(os.getenv('MAX_DET', '100'))
+IMGSZ   = int(os.getenv('IMGSZ', '416'))
+CONF    = float(os.getenv('CONF', '0.25'))
+IOU     = float(os.getenv('IOU', '0.45'))   # Note: post_process에서 IOU는 NMS에 직접 사용되지 않지만 값 유지
+DEVICE  = os.getenv('DEVICE', '0')          # "0" or "cpu"
+PORT    = os.getenv('PORT', '30034')
+BASE_DIR = Path(os.getenv('BASE_DIR', str(Path(__file__).parent)))
+
+# ---- proxy (원앱 호환) ----
+os.environ['HTTP_PROXY']  = os.getenv('HTTP_PROXY',  'http://168.219.61.252:8080')
+os.environ['HTTPS_PROXY'] = os.getenv('HTTPS_PROXY', 'http://168.219.61.252:8080')
+os.environ['NO_PROXY']    = os.getenv('NO_PROXY', 'localhost, 127.0.0.1')
+os.environ['REQUESTS_CA_BUNDLE'] = os.getenv('REQUESTS_CA_BUNDLE','/etc/ssl/certs/ca-certificates.crt')
+os.environ['CURL_CA_BUNDLE']     = os.getenv('CURL_CA_BUNDLE',    '/etc/ssl/certs/ca-certificates.crt')
+
+def backend_factory() -> requests.Session:
+    session = requests.Session()
+    http = os.environ.get('HTTP_PROXY')
+    https = os.environ.get('HTTPS_PROXY')
+    if http or https:
+        session.proxies = {'http': http, 'https': https}
+    verify = os.environ.get('REQUESTS_CA_BUNDLE')
+    if verify:
+        session.verify = verify
+    return session
+
+# =========================
+# Logging helpers (원앱 호환)
+# =========================
+def print_debug(msg_type, msg_contents):
+    time_ = time.strftime('%a %d %b %Y %H:%M:%S.%f'[:-3], time.localtime())
+    print(f'[{msg_type} {time_}] {msg_contents}')
+
+def deliver_msg(socket_, msg_type_, msg_):
+    print_debug(msg_type_, msg_)
+    if msg_type_ == 'ERROR':
+        logging.error(msg_)
+    elif msg_type_ == 'WARNING':
+        logging.warning(msg_)
+    else:
+        logging.info(msg_)
+
+# =========================
+# Geometry utils
+# =========================
+def xyxy_to_cxcywh(xyxy):
+    x1, y1, x2, y2 = xyxy
+    w = x2 - x1
+    h = y2 - y1
+    cx = x1 + w / 2.0
+    cy = y1 + h / 2.0
+    return cx, cy, w, h
+
+# =========================
+# App
+# =========================
+def main():
+    global DEVICE, MAX_DET, IMGSZ, CONF, IOU, PORT, BASE_DIR
+    configure_http_backend(backend_factory=backend_factory)
+
+    # ---- log dir ----
+    log_dir = BASE_DIR / 'log'
+    log_dir.mkdir(parents=True, exist_ok=True)
+    formatter = logging.Formatter('%(levelname)s %(asctime)s %(message)s')
+    log_handler = handlers.TimedRotatingFileHandler(
+        filename=str(log_dir / 'batch_debug_msg.log'),
+        when='midnight', interval=1, encoding='utf-8')
+    log_handler.setFormatter(formatter)
+    log_handler.suffix = '%Y%m%d'
+    logger = logging.getLogger()
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(log_handler)
+
+    # =========================
+    # Load RTDetrV2 (local directory with config.json, model.safetensors, preprocessor_config.json)
+    # =========================
+    models_dir = BASE_DIR / 'models'   # 컨테이너에 -v 로 마운트하거나 이미지에 포함
+    if not models_dir.exists():
+        deliver_msg(None, 'ERROR', f'Models directory not found: {models_dir}')
+        return
+
+    try:
+        # Device pick (GPU/CPU)
+        if DEVICE != 'cpu' and torch.cuda.is_available():
+            try:
+                dev_index = int(DEVICE)
+                if dev_index >= torch.cuda.device_count():
+                    deliver_msg(None, 'WARNING', f'Device {dev_index} not available, fallback to 0')
+                    dev_index = 0
+                torch_device = torch.device(f'cuda:{dev_index}')
+                deliver_msg(None, 'INFO', f'Using CUDA device {dev_index}: {torch.cuda.get_device_name(dev_index)}')
+            except Exception:
+                torch_device = torch.device('cuda:0')
+                deliver_msg(None, 'WARNING', f'Invalid DEVICE={DEVICE}, fallback to cuda:0')
+        else:
+            torch_device = torch.device('cpu')
+            deliver_msg(None, 'INFO', 'Using CPU device')
+        deliver_msg(None, 'INFO', f'Python: {sys.version}')
+        deliver_msg(None, 'INFO', f'Torch:  {torch.__version__}')
+
+        # Load processor & model from local dir
+        deliver_msg(None, 'INFO', f'Loading RTDetrV2 from: {models_dir}')
+        processor = AutoImageProcessor.from_pretrained(str(models_dir))
+        model = AutoModelForObjectDetection.from_pretrained(str(models_dir))
+        model.to(torch_device)
+        model.eval()
+
+        # class names
+        id2label = getattr(model.config, 'id2label', None) or {}
+        if not id2label:
+            deliver_msg(None, 'WARNING', 'id2label not found in model.config; using numeric labels')
+        class_names = [id2label[i] if i in id2label else str(i) for i in range(getattr(model.config, 'num_labels', 0))]
+        if not class_names:
+            deliver_msg(None, 'WARNING', 'class_names empty; will still return numeric classes')
+
+        # cuDNN flags similar to YOLO app
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
+
+        # Warm-up
+        try:
+            dummy = np.zeros((IMGSZ, IMGSZ, 3), dtype=np.uint8)
+            inputs = processor(images=[dummy[..., ::-1]], return_tensors="pt")  # BGR->RGB
+            inputs = {k: v.to(torch_device) for k, v in inputs.items()}
+            with torch.inference_mode():
+                _ = model(**inputs)
+            deliver_msg(None, 'INFO', 'warm-up done')
+        except Exception as e:
+            deliver_msg(None, 'ERROR', f'warm-up failed: {e}')
+            return
+
+    except Exception as e:
+        deliver_msg(None, 'ERROR', f'Failed to load model/processor: {e}')
+        return
+
+    # =========================
+    # ZMQ
+    # =========================
+    context = zmq.Context()
+    socket = context.socket(zmq.REP)
+    socket.setsockopt(zmq.RCVTIMEO, 60000)
+    socket.setsockopt(zmq.SNDTIMEO, 60000)
+    socket.setsockopt(zmq.LINGER, 0)
+    socket.bind(f'tcp://*:{PORT}')
+    deliver_msg(None, 'INFO', f'starting a new unified session at tcp://*:{PORT}')
+
+    while True:
+        # ---- receive ----
+        try:
+            msg_dict = socket.recv_json()
+            deliver_msg(None, 'INFO', 'a new message arrived!')
+        except zmq.Again:
+            continue
+        except zmq.ZMQError as e:
+            deliver_msg(None, 'ERROR', f'ZMQ error: {e}')
+            break
+        except Exception as e:
+            deliver_msg(None, 'ERROR', f'recv error: {e}')
+            break
+
+        # ---- parse fields ----
+        if 'project' not in msg_dict:
+            deliver_msg(None, 'ERROR', 'project missing'); continue
+        project_name = msg_dict['project']
+        deliver_msg(None, 'INFO', f'project_name: {project_name}')
+
+        if 'model' not in msg_dict:
+            deliver_msg(socket, 'ERROR', 'model missing'); continue
+        model_name = msg_dict['model']
+        deliver_msg(None, 'INFO', f'model_id: {model_name}')
+
+        if 'command' not in msg_dict:
+            deliver_msg(None, 'ERROR', 'command missing'); continue
+        cmd_ = msg_dict['command']
+        deliver_msg(None, 'INFO', f'Received command: {cmd_}')
+
+        if cmd_ != 'inference':
+            deliver_msg(None, 'ERROR', f'Unsupported command: {cmd_}')
+            continue
+
+        if 'data' not in msg_dict or not msg_dict['data']:
+            deliver_msg(None, 'ERROR', 'For inference, "data" missing, invalid, or empty')
+            continue
+
+        # ---- normalize to list of {name, data} ----
+        if isinstance(msg_dict['data'], list):
+            images_to_process = msg_dict['data']
+            deliver_msg(None, 'INFO', f'Processing batch inference request for {len(images_to_process)} images.')
+        else:
+            image_name = msg_dict.get('name', f'single_image_{int(time.time())}')
+            image_b64_data = msg_dict['data']
+            images_to_process = [{'name': image_name, 'data': image_b64_data}]
+            deliver_msg(None, 'INFO', f'Processing single inference request for image: {image_name}')
+
+        # =========================
+        # Preprocess (원앱과 동일 패딩→사이즈 조정→복원정보 기록)
+        # =========================
+        resized_images = []
+        meta_list = []
+        try:
+            t0_pre = time.time()
+            for item in images_to_process:
+                image_name = item.get('name')
+                image_b64 = item.get('data')
+                try:
+                    payload = base64.b64decode(image_b64)
+                    jpg_np  = np.frombuffer(payload, dtype=np.uint8)
+                    img_bgr = cv2.imdecode(jpg_np, cv2.IMREAD_COLOR)
+                    if img_bgr is None:
+                        raise ValueError("cv2.imdecode returned None")
+                    deliver_msg(None, 'INFO', f'Shape of the input image {image_name}: {img_bgr.shape}')
+
+                    h, w = img_bgr.shape[:2]
+                    diff = w - h
+                    x_offset = 0
+                    y_offset = 0
+                    side = max(w, h)
+                    img_pad = np.zeros((side, side, 3), np.uint8)
+                    if diff > 0:  # width > height → top/bottom padding
+                        y_offset = diff // 2
+                        img_pad[y_offset:y_offset+h, :w] = img_bgr
+                        deliver_msg(None, 'INFO', f'Padding top/bottom for {image_name}, y_offset: {y_offset}')
+                    elif diff < 0:  # height > width → left/right padding
+                        x_offset = (-diff) // 2
+                        img_pad[:h, x_offset:x_offset+w] = img_bgr
+                        deliver_msg(None, 'INFO', f'Padding left/right for {image_name}, x_offset: {x_offset}')
+                    else:
+                        img_pad = img_bgr
+
+                    deliver_msg(None, 'INFO', f'Shape of the padded image {image_name}: {img_pad.shape}')
+                    img_resized = cv2.resize(img_pad, (IMGSZ, IMGSZ), interpolation=cv2.INTER_LINEAR)
+                    deliver_msg(None, 'INFO', f'Shape of the resized image {image_name}: {img_resized.shape}')
+
+                    reconstruction_ratio = img_pad.shape[0] / IMGSZ
+                    deliver_msg(None, 'INFO', f'Reconstruction ratio for {image_name}: {reconstruction_ratio:.4f}')
+
+                    resized_images.append(img_resized)  # BGR
+                    meta_list.append({
+                        "name": image_name,
+                        "reconstruction_ratio": reconstruction_ratio,
+                        "x_offset": x_offset,
+                        "y_offset": y_offset,
+                        "original_width": w,
+                        "original_height": h,
+                        "padded_side": img_pad.shape[0],  # target_sizes에 사용
+                    })
+                except Exception as e_pre:
+                    deliver_msg(None, 'ERROR', f'Error preprocessing image {image_name}: {e_pre}')
+            deliver_msg(None, 'INFO', f'preprocessing elapsed : {time.time()-t0_pre:.2f}s')
+        except Exception as e_overall:
+            deliver_msg(None, 'ERROR', f'Critical error during overall preprocessing phase: {e_overall}')
+            continue
+
+        # =========================
+        # Inference
+        # =========================
+        if resized_images:
+            try:
+                deliver_msg(None, 'INFO', f'Performing inference on {len(resized_images)} images...')
+                t0_inf = time.time()
+
+                # Processor expects RGB
+                rgb_batch = [cv2.cvtColor(x, cv2.COLOR_BGR2RGB) for x in resized_images]
+                inputs = processor(images=rgb_batch, return_tensors="pt")
+                inputs = {k: v.to(model.device) for k, v in inputs.items()}
+
+                with torch.inference_mode():
+                    outputs = model(**inputs)
+
+                # Post-process to padded square size (IMGSZ→padded_side scale restores via ratio)
+                target_sizes = torch.tensor([[IMGSZ, IMGSZ]] * len(rgb_batch), device=model.device)
+                processed = processor.post_process_object_detection(
+                    outputs, threshold=CONF, target_sizes=target_sizes
+                )
+                deliver_msg(None, 'INFO', f'inference elapsed: {time.time()-t0_inf:.2f}s')
+
+                # =========================
+                # Postprocess (YOLO 앱과 동일 응답 포맷)
+                # =========================
+                final_results = []
+                for p, meta in zip(processed, meta_list):
+                    boxes = p.get("boxes")
+                    scores = p.get("scores")
+                    labels = p.get("labels")
+
+                    boxes = boxes.detach().cpu().numpy() if boxes is not None else np.zeros((0,4), dtype=np.float32)
+                    scores = scores.detach().cpu().numpy() if scores is not None else np.zeros((0,), dtype=np.float32)
+                    labels = labels.detach().cpu().numpy().astype(int) if labels is not None else np.zeros((0,), dtype=int)
+
+                    # Optional: top-K by score
+                    if len(scores) > MAX_DET:
+                        idxs = np.argsort(-scores)[:MAX_DET]
+                        boxes, scores, labels = boxes[idxs], scores[idxs], labels[idxs]
+
+                    image_name = meta["name"]
+                    ratio = meta["reconstruction_ratio"]
+                    x_off = meta["x_offset"]
+                    y_off = meta["y_offset"]
+                    ow = meta["original_width"]
+                    oh = meta["original_height"]
+
+                    image_result = {"name": image_name, "detections": []}
+                    for b, sc, lb in zip(boxes, scores, labels):
+                        # b = [x1, y1, x2, y2] on padded-resized (IMGSZ)
+                        # 1) to padded coordinate
+                        x1, y1, x2, y2 = b
+                        # 2) up-scale to padded original size
+                        x1 *= ratio; y1 *= ratio; x2 *= ratio; y2 *= ratio
+                        # 3) unpad to original image
+                        if ow > oh:   # top/bottom padding
+                            y1 -= y_off; y2 -= y_off
+                        elif ow < oh: # left/right padding
+                            x1 -= x_off; x2 -= x_off
+
+                        # clamp to original image bounds
+                        x1 = max(0.0, min(float(x1), ow))
+                        y1 = max(0.0, min(float(y1), oh))
+                        x2 = max(0.0, min(float(x2), ow))
+                        y2 = max(0.0, min(float(y2), oh))
+
+                        cx, cy, ww, hh = xyxy_to_cxcywh((x1, y1, x2, y2))
+                        conf_pct = round(float(sc * 100.0), 1)
+                        label_idx = int(lb)
+                        label_name = class_names[label_idx] if 0 <= label_idx < len(class_names) else str(label_idx)
+
+                        image_result["detections"].append({
+                            "category": label_name,
+                            "confidence": conf_pct,
+                            "center_x": round(cx, 2),
+                            "center_y": round(cy, 2),
+                            "width":    round(ww, 2),
+                            "height":   round(hh, 2),
+                        })
+
+                    deliver_msg(None, 'INFO', f'Detections({len(image_result["detections"])}) for {image_name} processed.')
+                    final_results.append(image_result)
+
+                try:
+                    socket.send_json(final_results)
+                except Exception as e_send:
+                    deliver_msg(None, 'ERROR', f'Failed to send results: {e_send}')
+
+            except Exception as e_inf:
+                deliver_msg(None, 'ERROR', f'Error during batch inference: {e_inf}')
+                try:
+                    socket.send_json([])
+                except Exception:
+                    pass
+        else:
+            deliver_msg(None, 'WARNING', 'No images were successfully preprocessed for this batch.')
+            try:
+                socket.send_json([])
+            except Exception:
+                pass
+
+        deliver_msg(None, 'INFO', 'End of cycle!')
+
+    deliver_msg(None, 'INFO', 'closing the session')
+    try:
+        socket.close()
+    except Exception:
+        pass
+    context.destroy()
+
+if __name__ == '__main__':
+    main()
