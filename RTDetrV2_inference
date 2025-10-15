@@ -1,394 +1,262 @@
-# Re-create the cleaned app.py file (ensuring the session is active).
-content = r'''
-import os
-import sys
-import cv2
-import zmq
-import json
-import base64
-import time
-import yaml
-import torch
-import requests
-import numpy as np
-import logging
-from logging import handlers
+# Jupyter-ready RTDetrV2 batch inference with inline visualization & metrics
+# This cell is SAFE to run even if dependencies are missing; it will show guidance instead of crashing.
+
 from pathlib import Path
-from datetime import datetime
-from typing import List, Dict, Any, Optional, Tuple
+from typing import List, Dict, Any, Iterable, Tuple
+import time
+import math
+import json
 
-from huggingface_hub import configure_http_backend
-from transformers import (
-    AutoImageProcessor,
-    AutoModelForObjectDetection,
-)
+import numpy as np
+import pandas as pd
+from PIL import Image
+import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
+from tqdm import tqdm
 
-# =========================
-# Env & Defaults
-# =========================
-MAX_DET = int(os.getenv('MAX_DET', '100'))
-IMGSZ   = int(os.getenv('IMGSZ', '416'))
-CONF    = float(os.getenv('CONF', '0.25'))
-IOU     = float(os.getenv('IOU', '0.45'))   # Note: post_process에서 IOU는 NMS에 직접 사용되지 않지만 값 유지
-DEVICE  = os.getenv('DEVICE', '0')          # "0" or "cpu"
-PORT    = os.getenv('PORT', '30034')
-BASE_DIR = Path(os.getenv('BASE_DIR', str(Path(__file__).parent)))
-
-# ---- proxy (원앱 호환) ----
-os.environ['HTTP_PROXY']  = os.getenv('HTTP_PROXY',  'http://168.219.61.252:8080')
-os.environ['HTTPS_PROXY'] = os.getenv('HTTPS_PROXY', 'http://168.219.61.252:8080')
-os.environ['NO_PROXY']    = os.getenv('NO_PROXY', 'localhost, 127.0.0.1')
-os.environ['REQUESTS_CA_BUNDLE'] = os.getenv('REQUESTS_CA_BUNDLE','/etc/ssl/certs/ca-certificates.crt')
-os.environ['CURL_CA_BUNDLE']     = os.getenv('CURL_CA_BUNDLE',    '/etc/ssl/certs/ca-certificates.crt')
-
-def backend_factory() -> requests.Session:
-    session = requests.Session()
-    http = os.environ.get('HTTP_PROXY')
-    https = os.environ.get('HTTPS_PROXY')
-    if http or https:
-        session.proxies = {'http': http, 'https': https}
-    verify = os.environ.get('REQUESTS_CA_BUNDLE')
-    if verify:
-        session.verify = verify
-    return session
+# For nice, scrollable tables in the UI
+from caas_jupyter_tools import display_dataframe_to_user
 
 # =========================
-# Logging helpers (원앱 호환)
+# Configuration (edit here)
 # =========================
-def print_debug(msg_type, msg_contents):
-    time_ = time.strftime('%a %d %b %Y %H:%M:%S.%f'[:-3], time.localtime())
-    print(f'[{msg_type} {time_}] {msg_contents}')
+MODEL_DIR = Path("/path/to/your_finetuned_model_dir")  # folder with config.json, model.safetensors, preprocessor_config.json
+IMAGE_DIR = Path("/path/to/images")                    # directory to scan for images (recursively)
+THRESHOLD = 0.25                                       # confidence score threshold
+BATCH_SIZE = 8                                         # images per batch
+DEVICE = "auto"                                        # "auto", -1 for CPU, or CUDA index like 0, 1, ...
+FP16 = True                                            # enable autocast on CUDA
+DISPLAY_MAX = 12                                       # max annotated images to display
+PRINT_JSON_SAMPLE = 2                                  # print raw detections for first N images for inspection
 
-def deliver_msg(socket_, msg_type_, msg_):
-    print_debug(msg_type_, msg_)
-    if msg_type_ == 'ERROR':
-        logging.error(msg_)
-    elif msg_type_ == 'WARNING':
-        logging.warning(msg_)
-    else:
-        logging.info(msg_)
+# =====================================
+# Helpers
+# =====================================
+IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
-# =========================
-# Geometry utils
-# =========================
-def xyxy_to_cxcywh(xyxy):
-    x1, y1, x2, y2 = xyxy
-    w = x2 - x1
-    h = y2 - y1
-    cx = x1 + w / 2.0
-    cy = y1 + h / 2.0
-    return cx, cy, w, h
+def find_images(image_dir: Path) -> List[Path]:
+    return [p for p in sorted(image_dir.rglob("*")) if p.suffix.lower() in IMG_EXTS]
 
-# =========================
-# App
-# =========================
-def main():
-    global DEVICE, MAX_DET, IMGSZ, CONF, IOU, PORT, BASE_DIR
-    configure_http_backend(backend_factory=backend_factory)
+def chunked(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i+n]
 
-    # ---- log dir ----
-    log_dir = BASE_DIR / 'log'
-    log_dir.mkdir(parents=True, exist_ok=True)
-    formatter = logging.Formatter('%(levelname)s %(asctime)s %(message)s')
-    log_handler = handlers.TimedRotatingFileHandler(
-        filename=str(log_dir / 'batch_debug_msg.log'),
-        when='midnight', interval=1, encoding='utf-8')
-    log_handler.setFormatter(formatter)
-    log_handler.suffix = '%Y%m%d'
-    logger = logging.getLogger()
-    logger.setLevel(logging.DEBUG)
-    logger.addHandler(log_handler)
-
-    # =========================
-    # Load RTDetrV2 (local directory with config.json, model.safetensors, preprocessor_config.json)
-    # =========================
-    models_dir = BASE_DIR / 'models'   # 컨테이너에 -v 로 마운트하거나 이미지에 포함
-    if not models_dir.exists():
-        deliver_msg(None, 'ERROR', f'Models directory not found: {models_dir}')
-        return
-
-    try:
-        # Device pick (GPU/CPU)
-        if DEVICE != 'cpu' and torch.cuda.is_available():
-            try:
-                dev_index = int(DEVICE)
-                if dev_index >= torch.cuda.device_count():
-                    deliver_msg(None, 'WARNING', f'Device {dev_index} not available, fallback to 0')
-                    dev_index = 0
-                torch_device = torch.device(f'cuda:{dev_index}')
-                deliver_msg(None, 'INFO', f'Using CUDA device {dev_index}: {torch.cuda.get_device_name(dev_index)}')
-            except Exception:
-                torch_device = torch.device('cuda:0')
-                deliver_msg(None, 'WARNING', f'Invalid DEVICE={DEVICE}, fallback to cuda:0')
-        else:
-            torch_device = torch.device('cpu')
-            deliver_msg(None, 'INFO', 'Using CPU device')
-        deliver_msg(None, 'INFO', f'Python: {sys.version}')
-        deliver_msg(None, 'INFO', f'Torch:  {torch.__version__}')
-
-        # Load processor & model from local dir
-        deliver_msg(None, 'INFO', f'Loading RTDetrV2 from: {models_dir}')
-        processor = AutoImageProcessor.from_pretrained(str(models_dir))
-        model = AutoModelForObjectDetection.from_pretrained(str(models_dir))
-        model.to(torch_device)
-        model.eval()
-
-        # class names
-        id2label = getattr(model.config, 'id2label', None) or {}
-        if not id2label:
-            deliver_msg(None, 'WARNING', 'id2label not found in model.config; using numeric labels')
-        class_names = [id2label[i] if i in id2label else str(i) for i in range(getattr(model.config, 'num_labels', 0))]
-        if not class_names:
-            deliver_msg(None, 'WARNING', 'class_names empty; will still return numeric classes')
-
-        # cuDNN flags similar to YOLO app
-        torch.backends.cudnn.benchmark = True
-        torch.backends.cudnn.deterministic = False
-
-        # Warm-up
+def pil_loader(paths: List[Path]) -> List[Image.Image]:
+    imgs = []
+    for p in paths:
         try:
-            dummy = np.zeros((IMGSZ, IMGSZ, 3), dtype=np.uint8)
-            inputs = processor(images=[dummy[..., ::-1]], return_tensors="pt")  # BGR->RGB
-            inputs = {k: v.to(torch_device) for k, v in inputs.items()}
-            with torch.inference_mode():
-                _ = model(**inputs)
-            deliver_msg(None, 'INFO', 'warm-up done')
+            imgs.append(Image.open(p).convert("RGB"))
         except Exception as e:
-            deliver_msg(None, 'ERROR', f'warm-up failed: {e}')
-            return
+            print(f"[WARN] Failed to open image {p}: {e}")
+            imgs.append(None)
+    return imgs
 
-    except Exception as e:
-        deliver_msg(None, 'ERROR', f'Failed to load model/processor: {e}')
-        return
-
-    # =========================
-    # ZMQ
-    # =========================
-    context = zmq.Context()
-    socket = context.socket(zmq.REP)
-    socket.setsockopt(zmq.RCVTIMEO, 60000)
-    socket.setsockopt(zmq.SNDTIMEO, 60000)
-    socket.setsockopt(zmq.LINGER, 0)
-    socket.bind(f'tcp://*:{PORT}')
-    deliver_msg(None, 'INFO', f'starting a new unified session at tcp://*:{PORT}')
-
-    while True:
-        # ---- receive ----
-        try:
-            msg_dict = socket.recv_json()
-            deliver_msg(None, 'INFO', 'a new message arrived!')
-        except zmq.Again:
-            continue
-        except zmq.ZMQError as e:
-            deliver_msg(None, 'ERROR', f'ZMQ error: {e}')
-            break
-        except Exception as e:
-            deliver_msg(None, 'ERROR', f'recv error: {e}')
-            break
-
-        # ---- parse fields ----
-        if 'project' not in msg_dict:
-            deliver_msg(None, 'ERROR', 'project missing'); continue
-        project_name = msg_dict['project']
-        deliver_msg(None, 'INFO', f'project_name: {project_name}')
-
-        if 'model' not in msg_dict:
-            deliver_msg(socket, 'ERROR', 'model missing'); continue
-        model_name = msg_dict['model']
-        deliver_msg(None, 'INFO', f'model_id: {model_name}')
-
-        if 'command' not in msg_dict:
-            deliver_msg(None, 'ERROR', 'command missing'); continue
-        cmd_ = msg_dict['command']
-        deliver_msg(None, 'INFO', f'Received command: {cmd_}')
-
-        if cmd_ != 'inference':
-            deliver_msg(None, 'ERROR', f'Unsupported command: {cmd_}')
-            continue
-
-        if 'data' not in msg_dict or not msg_dict['data']:
-            deliver_msg(None, 'ERROR', 'For inference, "data" missing, invalid, or empty')
-            continue
-
-        # ---- normalize to list of {name, data} ----
-        if isinstance(msg_dict['data'], list):
-            images_to_process = msg_dict['data']
-            deliver_msg(None, 'INFO', f'Processing batch inference request for {len(images_to_process)} images.')
-        else:
-            image_name = msg_dict.get('name', f'single_image_{int(time.time())}')
-            image_b64_data = msg_dict['data']
-            images_to_process = [{'name': image_name, 'data': image_b64_data}]
-            deliver_msg(None, 'INFO', f'Processing single inference request for image: {image_name}')
-
-        # =========================
-        # Preprocess (원앱과 동일 패딩→사이즈 조정→복원정보 기록)
-        # =========================
-        resized_images = []
-        meta_list = []
-        try:
-            t0_pre = time.time()
-            for item in images_to_process:
-                image_name = item.get('name')
-                image_b64 = item.get('data')
-                try:
-                    payload = base64.b64decode(image_b64)
-                    jpg_np  = np.frombuffer(payload, dtype=np.uint8)
-                    img_bgr = cv2.imdecode(jpg_np, cv2.IMREAD_COLOR)
-                    if img_bgr is None:
-                        raise ValueError("cv2.imdecode returned None")
-                    deliver_msg(None, 'INFO', f'Shape of the input image {image_name}: {img_bgr.shape}')
-
-                    h, w = img_bgr.shape[:2]
-                    diff = w - h
-                    x_offset = 0
-                    y_offset = 0
-                    side = max(w, h)
-                    img_pad = np.zeros((side, side, 3), np.uint8)
-                    if diff > 0:  # width > height → top/bottom padding
-                        y_offset = diff // 2
-                        img_pad[y_offset:y_offset+h, :w] = img_bgr
-                        deliver_msg(None, 'INFO', f'Padding top/bottom for {image_name}, y_offset: {y_offset}')
-                    elif diff < 0:  # height > width → left/right padding
-                        x_offset = (-diff) // 2
-                        img_pad[:h, x_offset:x_offset+w] = img_bgr
-                        deliver_msg(None, 'INFO', f'Padding left/right for {image_name}, x_offset: {x_offset}')
-                    else:
-                        img_pad = img_bgr
-
-                    deliver_msg(None, 'INFO', f'Shape of the padded image {image_name}: {img_pad.shape}')
-                    img_resized = cv2.resize(img_pad, (IMGSZ, IMGSZ), interpolation=cv2.INTER_LINEAR)
-                    deliver_msg(None, 'INFO', f'Shape of the resized image {image_name}: {img_resized.shape}')
-
-                    reconstruction_ratio = img_pad.shape[0] / IMGSZ
-                    deliver_msg(None, 'INFO', f'Reconstruction ratio for {image_name}: {reconstruction_ratio:.4f}')
-
-                    resized_images.append(img_resized)  # BGR
-                    meta_list.append({
-                        "name": image_name,
-                        "reconstruction_ratio": reconstruction_ratio,
-                        "x_offset": x_offset,
-                        "y_offset": y_offset,
-                        "original_width": w,
-                        "original_height": h,
-                        "padded_side": img_pad.shape[0],  # target_sizes에 사용
-                    })
-                except Exception as e_pre:
-                    deliver_msg(None, 'ERROR', f'Error preprocessing image {image_name}: {e_pre}')
-            deliver_msg(None, 'INFO', f'preprocessing elapsed : {time.time()-t0_pre:.2f}s')
-        except Exception as e_overall:
-            deliver_msg(None, 'ERROR', f'Critical error during overall preprocessing phase: {e_overall}')
-            continue
-
-        # =========================
-        # Inference
-        # =========================
-        if resized_images:
-            try:
-                deliver_msg(None, 'INFO', f'Performing inference on {len(resized_images)} images...')
-                t0_inf = time.time()
-
-                # Processor expects RGB
-                rgb_batch = [cv2.cvtColor(x, cv2.COLOR_BGR2RGB) for x in resized_images]
-                inputs = processor(images=rgb_batch, return_tensors="pt")
-                inputs = {k: v.to(model.device) for k, v in inputs.items()}
-
-                with torch.inference_mode():
-                    outputs = model(**inputs)
-
-                # Post-process to padded square size (IMGSZ→padded_side scale restores via ratio)
-                target_sizes = torch.tensor([[IMGSZ, IMGSZ]] * len(rgb_batch), device=model.device)
-                processed = processor.post_process_object_detection(
-                    outputs, threshold=CONF, target_sizes=target_sizes
-                )
-                deliver_msg(None, 'INFO', f'inference elapsed: {time.time()-t0_inf:.2f}s')
-
-                # =========================
-                # Postprocess (YOLO 앱과 동일 응답 포맷)
-                # =========================
-                final_results = []
-                for p, meta in zip(processed, meta_list):
-                    boxes = p.get("boxes")
-                    scores = p.get("scores")
-                    labels = p.get("labels")
-
-                    boxes = boxes.detach().cpu().numpy() if boxes is not None else np.zeros((0,4), dtype=np.float32)
-                    scores = scores.detach().cpu().numpy() if scores is not None else np.zeros((0,), dtype=np.float32)
-                    labels = labels.detach().cpu().numpy().astype(int) if labels is not None else np.zeros((0,), dtype=int)
-
-                    # Optional: top-K by score
-                    if len(scores) > MAX_DET:
-                        idxs = np.argsort(-scores)[:MAX_DET]
-                        boxes, scores, labels = boxes[idxs], scores[idxs], labels[idxs]
-
-                    image_name = meta["name"]
-                    ratio = meta["reconstruction_ratio"]
-                    x_off = meta["x_offset"]
-                    y_off = meta["y_offset"]
-                    ow = meta["original_width"]
-                    oh = meta["original_height"]
-
-                    image_result = {"name": image_name, "detections": []}
-                    for b, sc, lb in zip(boxes, scores, labels):
-                        # b = [x1, y1, x2, y2] on padded-resized (IMGSZ)
-                        # 1) to padded coordinate
-                        x1, y1, x2, y2 = b
-                        # 2) up-scale to padded original size
-                        x1 *= ratio; y1 *= ratio; x2 *= ratio; y2 *= ratio
-                        # 3) unpad to original image
-                        if ow > oh:   # top/bottom padding
-                            y1 -= y_off; y2 -= y_off
-                        elif ow < oh: # left/right padding
-                            x1 -= x_off; x2 -= x_off
-
-                        # clamp to original image bounds
-                        x1 = max(0.0, min(float(x1), ow))
-                        y1 = max(0.0, min(float(y1), oh))
-                        x2 = max(0.0, min(float(x2), ow))
-                        y2 = max(0.0, min(float(y2), oh))
-
-                        cx, cy, ww, hh = xyxy_to_cxcywh((x1, y1, x2, y2))
-                        conf_pct = round(float(sc * 100.0), 1)
-                        label_idx = int(lb)
-                        label_name = class_names[label_idx] if 0 <= label_idx < len(class_names) else str(label_idx)
-
-                        image_result["detections"].append({
-                            "category": label_name,
-                            "confidence": conf_pct,
-                            "center_x": round(cx, 2),
-                            "center_y": round(cy, 2),
-                            "width":    round(ww, 2),
-                            "height":   round(hh, 2),
-                        })
-
-                    deliver_msg(None, 'INFO', f'Detections({len(image_result["detections"])}) for {image_name} processed.')
-                    final_results.append(image_result)
-
-                try:
-                    socket.send_json(final_results)
-                except Exception as e_send:
-                    deliver_msg(None, 'ERROR', f'Failed to send results: {e_send}')
-
-            except Exception as e_inf:
-                deliver_msg(None, 'ERROR', f'Error during batch inference: {e_inf}')
-                try:
-                    socket.send_json([])
-                except Exception:
-                    pass
-        else:
-            deliver_msg(None, 'WARNING', 'No images were successfully preprocessed for this batch.')
-            try:
-                socket.send_json([])
-            except Exception:
-                pass
-
-        deliver_msg(None, 'INFO', 'End of cycle!')
-
-    deliver_msg(None, 'INFO', 'closing the session')
+def resolve_device(dev_choice: str, torch_available: bool) -> int:
+    if dev_choice == "auto":
+        return 0 if torch_available else -1
     try:
-        socket.close()
+        return int(dev_choice)
     except Exception:
-        pass
-    context.destroy()
+        raise ValueError(f'Invalid DEVICE "{dev_choice}" — use "auto", -1, or int like 0')
 
-if __name__ == '__main__':
-    main()
+def annotate_ax(ax, dets: List[Dict[str, Any]], img_w: int, img_h: int, score_thr: float):
+    # Do not specify colors per instructions (use matplotlib defaults)
+    for d in dets:
+        score = float(d.get("score", 0.0))
+        if score < score_thr:
+            continue
+        box = d.get("box", {})
+        xmin = float(box.get("xmin", 0.0))
+        ymin = float(box.get("ymin", 0.0))
+        xmax = float(box.get("xmax", 0.0))
+        ymax = float(box.get("ymax", 0.0))
+        # Clamp to image bounds
+        xmin = max(0.0, min(xmin, img_w - 1))
+        ymin = max(0.0, min(ymin, img_h - 1))
+        xmax = max(0.0, min(xmax, img_w - 1))
+        ymax = max(0.0, min(ymax, img_h - 1))
+        w = max(0.0, xmax - xmin)
+        h = max(0.0, ymax - ymin)
+        rect = Rectangle((xmin, ymin), w, h, fill=False, linewidth=1.5)
+        ax.add_patch(rect)
+        label = f"{d.get('label','')} {score:.2f}"
+        ax.text(xmin, max(0, ymin - 3), label, fontsize=8, bbox=dict(boxstyle="round", fc="w", ec="none", alpha=0.6))
+
+# =====================================
+# Safe dependency checks
+# =====================================
+missing = []
+try:
+    import torch
+    torch_available = True
+except Exception:
+    torch_available = False
+    missing.append("torch")
+
+try:
+    from transformers import pipeline
+    transformers_available = True
+except Exception:
+    transformers_available = False
+    missing.append("transformers")
+
+if missing:
+    print("[SETUP] Missing packages:", ", ".join(missing))
+    print("\nInstall in your notebook kernel, e.g.:")
+    cmds = []
+    if "torch" in missing:
+        cmds.append("pip install --upgrade torch --index-url https://download.pytorch.org/whl/cu118  # or cpu wheels")
+    if "transformers" in missing:
+        cmds.append("pip install --upgrade transformers>=4.40 pillow matplotlib pandas tqdm")
+    print("\n".join(cmds))
+    print("\nRe-run this cell after installing. No further actions were executed.")
+else:
+    # =====================================
+    # Load resources
+    # =====================================
+    assert MODEL_DIR.exists(), f"MODEL_DIR does not exist: {MODEL_DIR}"
+    assert IMAGE_DIR.exists(), f"IMAGE_DIR does not exist: {IMAGE_DIR}"
+
+    dev_index = resolve_device(DEVICE, torch_available)
+
+    objdet = pipeline(
+        task="object-detection",
+        model=str(MODEL_DIR),
+        device=dev_index,
+    )
+
+    img_paths: List[Path] = find_images(IMAGE_DIR)
+    assert len(img_paths) > 0, f"No images found under {IMAGE_DIR}"
+
+    print(f"[INFO] Found {len(img_paths)} image(s). Using device: {'CPU' if dev_index==-1 else f'CUDA:{dev_index}'}; FP16={FP16}")
+
+    # =====================================
+    # Inference loop
+    # =====================================
+    detections_all: List[Dict[str, Any]] = []   # flat list of detections (one row per detection)
+    per_image_rows: List[Dict[str, Any]] = []    # summary row per image
+    autocast_enabled = (FP16 and dev_index != -1 and torch.cuda.is_available())
+    amp_dtype = torch.float16 if autocast_enabled else None
+
+    total_start = time.perf_counter()
+    n_processed = 0
+
+    for batch_paths in tqdm(list(chunked(img_paths, BATCH_SIZE)), desc="Batches"):
+        batch_imgs = pil_loader(batch_paths)
+        valid_pairs = [(p, im) for p, im in zip(batch_paths, batch_imgs) if im is not None]
+        if not valid_pairs:
+            continue
+
+        images = [im for _, im in valid_pairs]
+
+        start = time.perf_counter()
+        with torch.cuda.amp.autocast(enabled=autocast_enabled, dtype=amp_dtype) if autocast_enabled else torch.no_grad():
+            dets_list = objdet(images, threshold=THRESHOLD, batch_size=len(images))
+        end = time.perf_counter()
+        batch_time = end - start
+        per_image_time = batch_time / max(1, len(images))
+
+        # Aggregate
+        for (p, im), dets in zip(valid_pairs, dets_list):
+            w, h = im.size
+            # filter again for safety
+            dets = [d for d in dets if float(d.get("score", 0.0)) >= THRESHOLD]
+            for d in dets:
+                box = d.get("box", {})
+                xmin = float(box.get("xmin", 0.0))
+                ymin = float(box.get("ymin", 0.0))
+                xmax = float(box.get("xmax", 0.0))
+                ymax = float(box.get("ymax", 0.0))
+                area = max(0.0, (xmax - xmin)) * max(0.0, (ymax - ymin))
+                detections_all.append({
+                    "image_path": str(p),
+                    "label": d.get("label", ""),
+                    "score": float(d.get("score", 0.0)),
+                    "xmin": xmin, "ymin": ymin, "xmax": xmax, "ymax": ymax,
+                    "width": w, "height": h, "area_px": area,
+                    "inf_time_s": per_image_time,
+                })
+            per_image_rows.append({
+                "image_path": str(p),
+                "width": w, "height": h,
+                "num_dets": len(dets),
+                "avg_score": float(np.mean([dd["score"] for dd in dets])) if dets else 0.0,
+                "latency_s": per_image_time,
+            })
+            n_processed += 1
+
+    total_end = time.perf_counter()
+    total_time = total_end - total_start
+    ips = n_processed / total_time if total_time > 0 else float("inf")
+
+    # =====================================
+    # Metrics & DataFrames
+    # =====================================
+    per_image_df = pd.DataFrame(per_image_rows)
+    dets_df = pd.DataFrame(detections_all)
+
+    print("\n=== Summary Metrics ===")
+    print(f"Images processed: {n_processed}")
+    print(f"Total time (s):  {total_time:.4f}")
+    print(f"Images/sec:      {ips:.2f}")
+    if len(per_image_df):
+        print(f"Median latency (s): {per_image_df['latency_s'].median():.4f}")
+        print(f"Mean detections / image: {per_image_df['num_dets'].mean():.2f}")
+
+    # Per-class distribution and score stats
+    if len(dets_df):
+        per_class = dets_df.groupby("label").agg(
+            detections=("label", "count"),
+            mean_score=("score", "mean"),
+            median_area_px=("area_px", "median"),
+        ).reset_index().sort_values("detections", ascending=False)
+    else:
+        per_class = pd.DataFrame(columns=["label", "detections", "mean_score", "median_area_px"])
+
+    # Top images by detections
+    if len(per_image_df):
+        top_images = per_image_df.sort_values("num_dets", ascending=False).head(10)
+    else:
+        top_images = pd.DataFrame(columns=["image_path","num_dets","avg_score","latency_s","width","height"])
+
+    # Display DataFrames in UI
+    display_dataframe_to_user("Per-image summary (latency & counts)", per_image_df)
+    display_dataframe_to_user("Per-class distribution", per_class)
+    display_dataframe_to_user("Top 10 images by detection count", top_images)
+
+    # Print a compact JSON-like preview for first N images
+    if PRINT_JSON_SAMPLE > 0 and len(dets_df):
+        print("\n=== Sample detections (first images) ===")
+        for ipath in per_image_df["image_path"].head(PRINT_JSON_SAMPLE).tolist():
+            rows = dets_df[dets_df["image_path"] == ipath]
+            sample = []
+            for _, r in rows.iterrows():
+                sample.append({
+                    "label": r["label"],
+                    "score": float(r["score"]),
+                    "box": {"xmin": float(r["xmin"]), "ymin": float(r["ymin"]), "xmax": float(r["xmax"]), "ymax": float(r["ymax"])}
+                })
+            print(f"- {ipath}")
+            print(json.dumps(sample, ensure_ascii=False, indent=2))
+
+    # =====================================
+    # Visualization (annotated images inline)
+    # One figure per image (as requested: each chart its own plot)
+    # =====================================
+    to_show = per_image_df["image_path"].tolist()[:DISPLAY_MAX] if len(per_image_df) else []
+    for ipath in to_show:
+        # Reload image (ensure fresh read & correct size)
+        im = Image.open(ipath).convert("RGB")
+        w, h = im.size
+        rows = dets_df[dets_df["image_path"] == ipath].to_dict(orient="records")
+
+        plt.figure(figsize=(10, 8))
+        plt.imshow(im)
+        ax = plt.gca()
+        ax.set_axis_off()
+        annotate_ax(ax, rows, w, h, THRESHOLD)
+        title = f"{Path(ipath).name} — dets: {len(rows)}"
+        plt.title(title)
+        plt.show()
+
+    print("\n[Done] All results shown inline (no files written).")
