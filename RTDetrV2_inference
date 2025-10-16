@@ -1,10 +1,17 @@
 # Jupyter-ready RTDetrV2 batch inference with inline visualization & metrics
-# This cell is SAFE to run even if dependencies are missing; it will show guidance instead of crashing.
+# - No CLI args: set variables below
+# - Avoids caas_jupyter_tools (uses IPython.display instead)
+# - Uses Transformers pipeline("object-detection")
+# - Shows annotated images inline (no disk writes)
+# - Prints summary metrics and displays DataFrames
+# - Measures throughput/latency
+#
+# Requirements: transformers >= 4.40, torch, pillow, matplotlib, pandas, tqdm
+# If not installed in your kernel: `pip install transformers torch pillow matplotlib pandas tqdm`
 
 from pathlib import Path
 from typing import List, Dict, Any, Iterable, Tuple
 import time
-import math
 import json
 
 import numpy as np
@@ -14,8 +21,8 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from tqdm import tqdm
 
-# For nice, scrollable tables in the UI
-from caas_jupyter_tools import display_dataframe_to_user
+# Pretty display without external helpers
+from IPython.display import display, HTML
 
 # =========================
 # Configuration (edit here)
@@ -103,12 +110,10 @@ except Exception:
 if missing:
     print("[SETUP] Missing packages:", ", ".join(missing))
     print("\nInstall in your notebook kernel, e.g.:")
-    cmds = []
     if "torch" in missing:
-        cmds.append("pip install --upgrade torch --index-url https://download.pytorch.org/whl/cu118  # or cpu wheels")
+        print("pip install --upgrade torch  # pick CUDA/CPU wheels appropriate for your machine")
     if "transformers" in missing:
-        cmds.append("pip install --upgrade transformers>=4.40 pillow matplotlib pandas tqdm")
-    print("\n".join(cmds))
+        print("pip install --upgrade 'transformers>=4.40' pillow matplotlib pandas tqdm")
     print("\nRe-run this cell after installing. No further actions were executed.")
 else:
     # =====================================
@@ -219,10 +224,13 @@ else:
     else:
         top_images = pd.DataFrame(columns=["image_path","num_dets","avg_score","latency_s","width","height"])
 
-    # Display DataFrames in UI
-    display_dataframe_to_user("Per-image summary (latency & counts)", per_image_df)
-    display_dataframe_to_user("Per-class distribution", per_class)
-    display_dataframe_to_user("Top 10 images by detection count", top_images)
+    # Display DataFrames nicely
+    display(HTML("<h3>Per-image summary (latency & counts)</h3>"))
+    display(per_image_df)
+    display(HTML("<h3>Per-class distribution</h3>"))
+    display(per_class)
+    display(HTML("<h3>Top 10 images by detection count</h3>"))
+    display(top_images)
 
     # Print a compact JSON-like preview for first N images
     if PRINT_JSON_SAMPLE > 0 and len(dets_df):
@@ -241,7 +249,7 @@ else:
 
     # =====================================
     # Visualization (annotated images inline)
-    # One figure per image (as requested: each chart its own plot)
+    # One figure per image (each chart its own plot; no color styles)
     # =====================================
     to_show = per_image_df["image_path"].tolist()[:DISPLAY_MAX] if len(per_image_df) else []
     for ipath in to_show:
