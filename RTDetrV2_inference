@@ -1,18 +1,12 @@
-# Jupyter-ready RTDetrV2 batch inference with inline visualization & metrics
-# - No CLI args: set variables below
-# - Avoids caas_jupyter_tools (uses IPython.display instead)
-# - Uses Transformers pipeline("object-detection")
-# - Shows annotated images inline (no disk writes)
-# - Prints summary metrics and displays DataFrames
-# - Measures throughput/latency
-#
-# Requirements: transformers >= 4.40, torch, pillow, matplotlib, pandas, tqdm
-# If not installed in your kernel: `pip install transformers torch pillow matplotlib pandas tqdm`
+# Jupyter-ready RTDetrV2 batch inference (ROLLED BACK) + enforce 640x640 preprocessing
+# - Same as the simple notebook version, plus:
+#   * loads AutoImageProcessor
+#   * forces size/pad to 640x640
+#   * passes processor to pipeline for consistent test-time preprocessing
 
 from pathlib import Path
-from typing import List, Dict, Any, Iterable, Tuple
-import time
-import json
+from typing import List, Dict, Any
+import time, json
 
 import numpy as np
 import pandas as pd
@@ -20,21 +14,20 @@ from PIL import Image
 import matplotlib.pyplot as plt
 from matplotlib.patches import Rectangle
 from tqdm import tqdm
-
-# Pretty display without external helpers
 from IPython.display import display, HTML
 
 # =========================
 # Configuration (edit here)
 # =========================
-MODEL_DIR = Path("/path/to/your_finetuned_model_dir")  # folder with config.json, model.safetensors, preprocessor_config.json
-IMAGE_DIR = Path("/path/to/images")                    # directory to scan for images (recursively)
-THRESHOLD = 0.25                                       # confidence score threshold
-BATCH_SIZE = 8                                         # images per batch
-DEVICE = "auto"                                        # "auto", -1 for CPU, or CUDA index like 0, 1, ...
-FP16 = True                                            # enable autocast on CUDA
-DISPLAY_MAX = 12                                       # max annotated images to display
-PRINT_JSON_SAMPLE = 2                                  # print raw detections for first N images for inspection
+MODEL_DIR = Path("/path/to/your_finetuned_model_dir")  # contains config.json, model.safetensors, preprocessor_config.json
+IMAGE_DIR = Path("/path/to/images")                    # directory with images
+THRESHOLD = 0.25
+BATCH_SIZE = 8
+DEVICE = "auto"     # "auto", -1 for CPU, or CUDA index like 0,1,...
+FP16 = True
+DISPLAY_MAX = 12
+PRINT_JSON_SAMPLE = 2
+TARGET_SIZE = 640   # enforce 640x640 like training
 
 # =====================================
 # Helpers
@@ -67,27 +60,20 @@ def resolve_device(dev_choice: str, torch_available: bool) -> int:
         raise ValueError(f'Invalid DEVICE "{dev_choice}" — use "auto", -1, or int like 0')
 
 def annotate_ax(ax, dets: List[Dict[str, Any]], img_w: int, img_h: int, score_thr: float):
-    # Do not specify colors per instructions (use matplotlib defaults)
     for d in dets:
         score = float(d.get("score", 0.0))
         if score < score_thr:
             continue
         box = d.get("box", {})
-        xmin = float(box.get("xmin", 0.0))
-        ymin = float(box.get("ymin", 0.0))
-        xmax = float(box.get("xmax", 0.0))
-        ymax = float(box.get("ymax", 0.0))
-        # Clamp to image bounds
-        xmin = max(0.0, min(xmin, img_w - 1))
-        ymin = max(0.0, min(ymin, img_h - 1))
-        xmax = max(0.0, min(xmax, img_w - 1))
-        ymax = max(0.0, min(ymax, img_h - 1))
-        w = max(0.0, xmax - xmin)
-        h = max(0.0, ymax - ymin)
+        xmin = float(box.get("xmin", 0.0)); ymin = float(box.get("ymin", 0.0))
+        xmax = float(box.get("xmax", 0.0)); ymax = float(box.get("ymax", 0.0))
+        xmin = max(0.0, min(xmin, img_w - 1)); ymin = max(0.0, min(ymin, img_h - 1))
+        xmax = max(0.0, min(xmax, img_w - 1)); ymax = max(0.0, min(ymax, img_h - 1))
+        w = max(0.0, xmax - xmin); h = max(0.0, ymax - ymin)
         rect = Rectangle((xmin, ymin), w, h, fill=False, linewidth=1.5)
         ax.add_patch(rect)
-        label = f"{d.get('label','')} {score:.2f}"
-        ax.text(xmin, max(0, ymin - 3), label, fontsize=8, bbox=dict(boxstyle="round", fc="w", ec="none", alpha=0.6))
+        ax.text(xmin, max(0, ymin - 3), f"{d.get('label','')} {score:.2f}", fontsize=8,
+                bbox=dict(boxstyle="round", fc="w", ec="none", alpha=0.6))
 
 # =====================================
 # Safe dependency checks
@@ -101,7 +87,7 @@ except Exception:
     missing.append("torch")
 
 try:
-    from transformers import pipeline
+    from transformers import pipeline, AutoImageProcessor
     transformers_available = True
 except Exception:
     transformers_available = False
@@ -109,12 +95,10 @@ except Exception:
 
 if missing:
     print("[SETUP] Missing packages:", ", ".join(missing))
-    print("\nInstall in your notebook kernel, e.g.:")
     if "torch" in missing:
-        print("pip install --upgrade torch  # pick CUDA/CPU wheels appropriate for your machine")
+        print("  pip install --upgrade torch  # pick CUDA/CPU wheels appropriate for your machine")
     if "transformers" in missing:
-        print("pip install --upgrade 'transformers>=4.40' pillow matplotlib pandas tqdm")
-    print("\nRe-run this cell after installing. No further actions were executed.")
+        print("  pip install --upgrade 'transformers>=4.40' pillow matplotlib pandas tqdm")
 else:
     # =====================================
     # Load resources
@@ -124,9 +108,59 @@ else:
 
     dev_index = resolve_device(DEVICE, torch_available)
 
+    # --- Load processor and force 640x640 like training ---
+    processor = AutoImageProcessor.from_pretrained(str(MODEL_DIR))
+    before = {
+        "size": getattr(processor, "size", None),
+        "do_resize": getattr(processor, "do_resize", None),
+        "do_pad": getattr(processor, "do_pad", None),
+        "pad_size": getattr(processor, "pad_size", None),
+        "size_divisor": getattr(processor, "size_divisor", None),
+        "pad_and_return_pixel_mask": getattr(processor, "pad_and_return_pixel_mask", None),
+    }
+
+    # Heuristics to enforce exact 640x640
+    # Many DETR/RT-DETR processors support dict size with keys like "height"/"width" or "shortest_edge".
+    try:
+        if hasattr(processor, "do_resize"):
+            processor.do_resize = True
+        # prefer explicit HxW if available
+        if hasattr(processor, "size"):
+            if isinstance(processor.size, dict):
+                if "height" in processor.size: processor.size["height"] = TARGET_SIZE
+                if "width"  in processor.size: processor.size["width"]  = TARGET_SIZE
+                if "shortest_edge" in processor.size: processor.size["shortest_edge"] = TARGET_SIZE
+            elif isinstance(processor.size, int):
+                processor.size = TARGET_SIZE
+        # padding to exact square if supported
+        if hasattr(processor, "do_pad"):
+            processor.do_pad = True
+        if hasattr(processor, "pad_and_return_pixel_mask"):
+            processor.pad_and_return_pixel_mask = True
+        if hasattr(processor, "pad_size"):
+            # some processors accept fixed pad_size
+            processor.pad_size = {"height": TARGET_SIZE, "width": TARGET_SIZE}
+        # if size_divisor exists, keep it (some models want stride alignment); otherwise exact HxW pad handles square.
+    except Exception as e:
+        print(f"[WARN] Could not fully force 640x640 on processor: {e}")
+
+    after = {
+        "size": getattr(processor, "size", None),
+        "do_resize": getattr(processor, "do_resize", None),
+        "do_pad": getattr(processor, "do_pad", None),
+        "pad_size": getattr(processor, "pad_size", None),
+        "size_divisor": getattr(processor, "size_divisor", None),
+        "pad_and_return_pixel_mask": getattr(processor, "pad_and_return_pixel_mask", None),
+    }
+
+    print("[Processor] BEFORE:", before)
+    print("[Processor] AFTER :", after)
+
+    # Build pipeline with our processor
     objdet = pipeline(
         task="object-detection",
         model=str(MODEL_DIR),
+        image_processor=processor,   # enforce our settings
         device=dev_index,
     )
 
@@ -138,8 +172,8 @@ else:
     # =====================================
     # Inference loop
     # =====================================
-    detections_all: List[Dict[str, Any]] = []   # flat list of detections (one row per detection)
-    per_image_rows: List[Dict[str, Any]] = []    # summary row per image
+    detections_all: List[Dict[str, Any]] = []
+    per_image_rows: List[Dict[str, Any]] = []
     autocast_enabled = (FP16 and dev_index != -1 and torch.cuda.is_available())
     amp_dtype = torch.float16 if autocast_enabled else None
 
@@ -161,17 +195,13 @@ else:
         batch_time = end - start
         per_image_time = batch_time / max(1, len(images))
 
-        # Aggregate
         for (p, im), dets in zip(valid_pairs, dets_list):
             w, h = im.size
-            # filter again for safety
             dets = [d for d in dets if float(d.get("score", 0.0)) >= THRESHOLD]
             for d in dets:
                 box = d.get("box", {})
-                xmin = float(box.get("xmin", 0.0))
-                ymin = float(box.get("ymin", 0.0))
-                xmax = float(box.get("xmax", 0.0))
-                ymax = float(box.get("ymax", 0.0))
+                xmin = float(box.get("xmin", 0.0)); ymin = float(box.get("ymin", 0.0))
+                xmax = float(box.get("xmax", 0.0)); ymax = float(box.get("ymax", 0.0))
                 area = max(0.0, (xmax - xmin)) * max(0.0, (ymax - ymin))
                 detections_all.append({
                     "image_path": str(p),
@@ -195,7 +225,7 @@ else:
     ips = n_processed / total_time if total_time > 0 else float("inf")
 
     # =====================================
-    # Metrics & DataFrames
+    # Metrics & Tables
     # =====================================
     per_image_df = pd.DataFrame(per_image_rows)
     dets_df = pd.DataFrame(detections_all)
@@ -208,7 +238,6 @@ else:
         print(f"Median latency (s): {per_image_df['latency_s'].median():.4f}")
         print(f"Mean detections / image: {per_image_df['num_dets'].mean():.2f}")
 
-    # Per-class distribution and score stats
     if len(dets_df):
         per_class = dets_df.groupby("label").agg(
             detections=("label", "count"),
@@ -216,15 +245,14 @@ else:
             median_area_px=("area_px", "median"),
         ).reset_index().sort_values("detections", ascending=False)
     else:
-        per_class = pd.DataFrame(columns=["label", "detections", "mean_score", "median_area_px"])
+        per_class = pd.DataFrame(columns=["label","detections","mean_score","median_area_px"])
 
-    # Top images by detections
-    if len(per_image_df):
-        top_images = per_image_df.sort_values("num_dets", ascending=False).head(10)
-    else:
-        top_images = pd.DataFrame(columns=["image_path","num_dets","avg_score","latency_s","width","height"])
+    top_images = (
+        per_image_df.sort_values("num_dets", ascending=False).head(10)
+        if len(per_image_df) else
+        pd.DataFrame(columns=["image_path","num_dets","avg_score","latency_s","width","height"])
+    )
 
-    # Display DataFrames nicely
     display(HTML("<h3>Per-image summary (latency & counts)</h3>"))
     display(per_image_df)
     display(HTML("<h3>Per-class distribution</h3>"))
@@ -232,7 +260,6 @@ else:
     display(HTML("<h3>Top 10 images by detection count</h3>"))
     display(top_images)
 
-    # Print a compact JSON-like preview for first N images
     if PRINT_JSON_SAMPLE > 0 and len(dets_df):
         print("\n=== Sample detections (first images) ===")
         for ipath in per_image_df["image_path"].head(PRINT_JSON_SAMPLE).tolist():
@@ -249,22 +276,18 @@ else:
 
     # =====================================
     # Visualization (annotated images inline)
-    # One figure per image (each chart its own plot; no color styles)
     # =====================================
     to_show = per_image_df["image_path"].tolist()[:DISPLAY_MAX] if len(per_image_df) else []
     for ipath in to_show:
-        # Reload image (ensure fresh read & correct size)
         im = Image.open(ipath).convert("RGB")
         w, h = im.size
         rows = dets_df[dets_df["image_path"] == ipath].to_dict(orient="records")
 
         plt.figure(figsize=(10, 8))
         plt.imshow(im)
-        ax = plt.gca()
-        ax.set_axis_off()
+        ax = plt.gca(); ax.set_axis_off()
         annotate_ax(ax, rows, w, h, THRESHOLD)
-        title = f"{Path(ipath).name} — dets: {len(rows)}"
-        plt.title(title)
+        plt.title(f"{Path(ipath).name} — dets: {len(rows)}")
         plt.show()
 
-    print("\n[Done] All results shown inline (no files written).")
+    print("\n[Done] Enforced 640×640 preprocessing; all results shown inline (no files written).")
